@@ -1,0 +1,105 @@
+name: "Release: v1.0-alpha"
+
+on:
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rs/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Run tests
+        working-directory: rs
+        run: cargo test -p helios --release
+
+      - name: Build release binary
+        working-directory: rs
+        run: cargo build --release -p helios
+
+      - name: Package release archive
+        run: |
+          ARCHIVE=helios-v1.0-alpha-linux-x86_64.tar.gz
+          mkdir -p dist
+          cp rs/target/release/helios dist/helios
+          cp README.md dist/README.md
+          cp LICENSE dist/LICENSE
+          cp -r bench dist/bench
+          tar -czf "${ARCHIVE}" -C dist .
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release (v1.0-alpha)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0-alpha
+          name: "Helios v1.0-alpha"
+          prerelease: ${{ inputs.prerelease == 'true' }}
+          body: |
+            ## Helios v1.0-alpha 🌞
+
+            **JIT at the edge — 80,000–117,000 requests/second on a single node.**
+
+            This is the first public alpha release of Helios, a high-performance Rust runtime for Workers-style JavaScript at the edge.
+
+            ### Highlights
+            - ⚡ **80–117k Req/s** sustained throughput — among the fastest JavaScript-capable runtimes available
+            - 🔄 Multi-worker dispatcher with round-robin, least-loaded, and power-of-two routing policies
+            - 🌐 HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) server via Hyper 1.x + Quinn
+            - 📦 Shared bytecode (XDR) cache across workers for reduced startup latency
+            - 🔌 WebTransport routing (HTTP/3 CONNECT)
+            - 🧊 Wizer-based WASM snapshot pre-initialization
+            - 🔬 Built-in closed-loop benchmark harness with HDR-histogram latency reporting
+
+            ### Assets
+            | File | Description |
+            |---|---|
+            | `helios-v1.0-alpha-linux-x86_64.tar.gz` | Linux x86-64 binary + README + LICENSE + bench scripts |
+            | `helios-v1.0-alpha-linux-x86_64.tar.gz.sha256` | SHA-256 checksum |
+
+            ### Quick start
+            ```sh
+            tar -xzf helios-v1.0-alpha-linux-x86_64.tar.gz
+            ./helios serve bench/helios-simple.js --port 8080 --workers 4
+            ```
+
+            ### Running the built-in benchmark
+            ```sh
+            ./helios bench http://127.0.0.1:8080/ --duration 15 --connections 64 --rate 100000 --json
+            ```
+          files: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

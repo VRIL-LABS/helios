@@ -3,7 +3,7 @@
 </p>
 
 # ☀️ Helios
-> **JIT at the edge, blazing like the sun.**
+> **JIT at the edge, blazing like the sun.**  
 > ***WinterJS promised the sun. Helios delivers it.***
 
 Helios is a high-performance Rust runtime for Workers-style JavaScript at the edge. It delivers **80,000–117,000 requests per second** on a single node — making it one of the fastest, if not *the* fastest, JavaScript-capable server runtime available.

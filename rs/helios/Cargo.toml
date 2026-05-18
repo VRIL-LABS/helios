@@ -1,0 +1,79 @@
+[package]
+name = "helios"
+version = "0.1.0"
+description = "HELIOS: a JIT-at-the-edge JavaScript runtime. JIT at the edge. Finally."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+default-run = "helios"
+
+[features]
+default = []
+# When enabled, the SpiderMonkey backend is linked in. Without it, the XDR and
+# WIT host modules expose a stub `JsEngineBackend` impl so the rest of the
+# crate (dispatcher, HTTP/3, bench, CLI) compiles and runs standalone.
+# Enabling this requires the SpiderMonkey/mozjs build toolchain.
+spidermonkey = []
+# Enable Wizer integration as a library dependency rather than subprocess.
+wizer-lib = ["dep:wizer"]
+
+[dependencies]
+# HTTP stack
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+
+# Async runtime
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# Lock-free primitives (Phase 1)
+crossbeam.workspace = true
+crossbeam-queue.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+
+# WIT / WASM Component Model (Phase 3)
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+capnp.workspace = true
+
+# Wizer (Phase 5) — optional; default path is subprocess invocation
+wizer = { workspace = true, optional = true }
+
+# Bench harness
+hdrhistogram.workspace = true
+reqwest.workspace = true
+
+# Misc
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+memchr.workspace = true
+once_cell.workspace = true
+arc-swap.workspace = true
+ring.workspace = true
+
+[[bin]]
+name = "helios"
+path = "src/main.rs"
+
+[lib]
+name = "helios"
+path = "src/lib.rs"

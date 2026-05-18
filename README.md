@@ -104,20 +104,18 @@ For local comparisons, run the parity servers in `bench/node-simple.js` or `benc
 Two manual workflows are available:
 
 * `Release: Build & Publish Binary` builds, tests, packages the Linux binary with `README.md`, `LICENSE`, and `bench/`, then publishes or updates a GitHub release.
-* `Release: Stage & Push Public Package` builds, tests, creates a GitHub release, optionally publishes to crates.io and npm, and pushes the staged package contents to `VRIL-LABS/helios`.
+* `Release: Build, Publish & Push Public Package` builds, tests, creates a GitHub release, and pushes the staged package contents (binary, Rust source, benchmarks, and assets) to `VRIL-LABS/helios`. crates.io and npm publishing run from the public repository.
 
-The `Release: Stage & Push Public Package` workflow accepts the following inputs:
+The `Release: Build, Publish & Push Public Package` workflow accepts the following inputs:
 
 | Input | Default | Description |
 |---|---|---|
-| `release_version` | `v1.0.0-alpha` | SemVer version label (leading `v` stripped automatically for Cargo/npm). |
+| `release_version` | `v1.0.0-alpha` | SemVer version label (e.g. `v1.2.3` or `v1.0.0-alpha`). |
 | `target_repository` | `VRIL-LABS/helios` | Repository that receives the staged git package. |
 | `target_branch` | `main` | Branch in the target repository to update. |
 | `prerelease` | `true` | Whether to mark the GitHub release as a prerelease. |
-| `publish_crates_io` | `false` | When `true`, publishes the `helios` crate to crates.io (requires `CARGO_REGISTRY_TOKEN` secret). |
-| `publish_npm` | `false` | When `true`, publishes `@vril-labs/helios` to the npm registry (requires `NPM_TOKEN` secret). |
 
-Required repository secrets: `PUBLIC_RELEASE_TOKEN` (write access to the target repo), `CARGO_REGISTRY_TOKEN` (crates.io API token, only needed when `publish_crates_io=true`), and `NPM_TOKEN` (npm publish token, only needed when `publish_npm=true`).
+Required repository secrets: `PUBLIC_RELEASE_TOKEN` (write access to the target repo).
 
 ## License
 

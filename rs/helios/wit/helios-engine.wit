@@ -1,0 +1,59 @@
+// HELIOS engine WIT interface — Phase 3.
+//
+// This interface places SpiderMonkey JIT *outside* the WASM sandbox. The
+// component (helios-worker.wasm) imports `js-engine`; the host implements
+// it natively where SpiderMonkey has full Baseline+Ion JIT (PROT_EXEC).
+//
+// Wire format for request/response bodies is Cap'n Proto (see
+// `wit/helios-rpc.capnp`), passed as `list<u8>` opaque blobs.
+
+package helios:engine@1.0.0;
+
+interface js-engine {
+    /// Opaque handle to a compiled+evaluated JS module living in the host.
+    type module-handle = u32;
+
+    record js-error {
+        message: string,
+        stack: option<string>,
+        // Best-effort source location: "<url>:<line>:<col>"
+        location: option<string>,
+    }
+
+    /// Compile and evaluate a JS module, returning an opaque handle.
+    /// The module's top-level `fetch` handler (or `addEventListener("fetch")`
+    /// registration) is captured and bound to the handle.
+    eval-module: func(source: string, module-url: string)
+        -> result<module-handle, js-error>;
+
+    /// Decode a precompiled XDR bytecode blob (see Phase 2) instead of
+    /// parsing source. This is the fast path used by all workers after
+    /// the first one warms the cache.
+    eval-xdr: func(xdr: list<u8>, module-url: string)
+        -> result<module-handle, js-error>;
+
+    /// Invoke the fetch handler for one request.
+    /// `req-bytes` is a Cap'n Proto serialized helios.Request.
+    /// Returns a Cap'n Proto serialized helios.Response.
+    call-fetch-handler: func(
+        handle: module-handle,
+        req-bytes: list<u8>,
+    ) -> result<list<u8>, js-error>;
+
+    /// Drain the microtask queue after a handler returns (Promise
+    /// continuations, queueMicrotask callbacks, etc).
+    drain-microtasks: func(handle: module-handle) -> result<_, js-error>;
+
+    /// Force a minor (nursery) GC. Used between requests for memory hygiene.
+    gc-minor: func(handle: module-handle);
+
+    /// Drop a module handle and free its associated SpiderMonkey roots.
+    drop-module: func(handle: module-handle);
+}
+
+world helios-worker {
+    import js-engine;
+    // Phase 3 worker exports the standard WASI HTTP incoming-handler.
+    // Wired up by the host via wasmtime-wasi-http.
+    export wasi:http/incoming-handler@0.3.0;
+}

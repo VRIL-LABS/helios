@@ -1,0 +1,231 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="440" viewBox="0 0 1400 440" role="img" aria-labelledby="title desc">
+  <title id="title">Helios animated frosted glass header</title>
+  <desc id="desc">A frosted glass neumorphic window with a glowing sun, dancing rays, and typography for Helios, a JIT-at-the-edge JavaScript runtime.</desc>
+  <defs>
+    <radialGradient id="sky" cx="50%" cy="45%" r="75%">
+      <stop offset="0%" stop-color="#fff9df"/>
+      <stop offset="22%" stop-color="#ffe49a"/>
+      <stop offset="52%" stop-color="#fb9f45"/>
+      <stop offset="78%" stop-color="#39206c"/>
+      <stop offset="100%" stop-color="#100925"/>
+    </radialGradient>
+
+    <radialGradient id="sunGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff8bd"/>
+      <stop offset="28%" stop-color="#ffd866" stop-opacity=".96"/>
+      <stop offset="57%" stop-color="#ff8d36" stop-opacity=".45"/>
+      <stop offset="100%" stop-color="#ff6c1f" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="glass" x1="10%" y1="0%" x2="90%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".58"/>
+      <stop offset="34%" stop-color="#fff7da" stop-opacity=".25"/>
+      <stop offset="70%" stop-color="#ffd278" stop-opacity=".16"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity=".36"/>
+    </linearGradient>
+
+    <linearGradient id="edge" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".94"/>
+      <stop offset="42%" stop-color="#ffffff" stop-opacity=".16"/>
+      <stop offset="100%" stop-color="#ffbf5f" stop-opacity=".58"/>
+    </linearGradient>
+
+    <linearGradient id="textGold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fffefa"/>
+      <stop offset="42%" stop-color="#fff0ad"/>
+      <stop offset="100%" stop-color="#ffbd54"/>
+    </linearGradient>
+
+    <filter id="softBlur" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="28"/>
+    </filter>
+
+    <filter id="glassBlur" x="-8%" y="-14%" width="116%" height="128%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="9" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0.08  0 1 0 0 0.04  0 0 1 0 0  0 0 0 .62 0"/>
+    </filter>
+
+    <filter id="shadow" x="-20%" y="-28%" width="140%" height="156%">
+      <feDropShadow dx="0" dy="28" stdDeviation="30" flood-color="#12081f" flood-opacity=".48"/>
+      <feDropShadow dx="0" dy="-10" stdDeviation="24" flood-color="#ffffff" flood-opacity=".18"/>
+    </filter>
+
+    <filter id="textShadow" x="-25%" y="-35%" width="150%" height="170%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#1a0800" flood-opacity=".78"/>
+      <feDropShadow dx="0" dy="0" stdDeviation="18" flood-color="#ff9200" flood-opacity=".44"/>
+    </filter>
+
+    <filter id="tagShadow" x="-20%" y="-60%" width="140%" height="220%">
+      <feDropShadow dx="0" dy="1" stdDeviation="2" flood-color="#1a0800" flood-opacity=".64"/>
+    </filter>
+
+    <linearGradient id="badgeFill" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffc840" stop-opacity=".28"/>
+      <stop offset="100%" stop-color="#ff8000" stop-opacity=".16"/>
+    </linearGradient>
+
+    <clipPath id="windowClip">
+      <rect x="160" y="72" width="1080" height="296" rx="56"/>
+    </clipPath>
+
+    <pattern id="grain" width="96" height="96" patternUnits="userSpaceOnUse">
+      <circle cx="8" cy="18" r="1.2" fill="#fff" opacity=".18"/>
+      <circle cx="58" cy="7" r=".9" fill="#fff" opacity=".12"/>
+      <circle cx="74" cy="56" r="1.1" fill="#fff" opacity=".13"/>
+      <circle cx="24" cy="70" r=".8" fill="#ffd88b" opacity=".16"/>
+      <circle cx="45" cy="42" r=".7" fill="#fff" opacity=".1"/>
+    </pattern>
+
+    <style>
+      @media (prefers-reduced-motion: reduce) {
+        .ray, .spark, .orb, .shine { animation: none !important; }
+      }
+
+      .ray {
+        animation: rotateRays 19s linear infinite;
+        transform-origin: 700px 226px;
+      }
+
+      .ray-slow {
+        animation-duration: 31s;
+        animation-direction: reverse;
+      }
+
+      .spark {
+        animation: drift 7s ease-in-out infinite;
+      }
+
+      .spark:nth-of-type(2n) {
+        animation-duration: 9s;
+        animation-delay: -2s;
+      }
+
+      .spark:nth-of-type(3n) {
+        animation-duration: 11s;
+        animation-delay: -5s;
+      }
+
+      .orb {
+        animation: breathe 5.5s ease-in-out infinite;
+        transform-origin: 700px 226px;
+      }
+
+      .shine {
+        animation: sweep 8s ease-in-out infinite;
+        transform-origin: 700px 220px;
+      }
+
+      @keyframes rotateRays {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+
+      @keyframes drift {
+        0%, 100% { transform: translate3d(0, 0, 0); opacity: .42; }
+        50% { transform: translate3d(18px, -16px, 0); opacity: .92; }
+      }
+
+      @keyframes breathe {
+        0%, 100% { transform: scale(.985); opacity: .9; }
+        50% { transform: scale(1.045); opacity: 1; }
+      }
+
+      @keyframes sweep {
+        0%, 100% { transform: translateX(-150px) rotate(-9deg); opacity: .08; }
+        46%, 58% { transform: translateX(150px) rotate(-9deg); opacity: .42; }
+      }
+    </style>
+  </defs>
+
+  <rect width="1400" height="440" fill="url(#sky)"/>
+  <path d="M0 332C151 267 244 291 365 330c150 49 244-23 376-54 174-41 274 65 420 60 102-3 169-44 239-92v196H0Z" fill="#150d2d" opacity=".42"/>
+  <path d="M0 359c177-68 314-29 459-6 174 28 294-69 452-61 181 9 252 91 489 17v131H0Z" fill="#09051a" opacity=".52"/>
+
+  <g class="orb">
+    <circle cx="700" cy="226" r="250" fill="url(#sunGlow)" filter="url(#softBlur)"/>
+    <circle cx="700" cy="226" r="122" fill="#fff2a3" opacity=".94"/>
+    <circle cx="700" cy="226" r="84" fill="#fff9d7" opacity=".86"/>
+  </g>
+
+  <g class="ray" opacity=".5">
+    <path d="M700 22 724 202 700 226 676 202Z" fill="#fff3a8"/>
+    <path d="M700 418 724 250 700 226 676 250Z" fill="#ffe08c"/>
+    <path d="M496 226 676 202 700 226 676 250Z" fill="#fff4bd"/>
+    <path d="M904 226 724 202 700 226 724 250Z" fill="#ffd06c"/>
+    <path d="M556 82 683 205 700 226 671 217Z" fill="#fff0a2"/>
+    <path d="M844 370 717 247 700 226 729 235Z" fill="#ffc35d"/>
+    <path d="M844 82 717 205 700 226 729 217Z" fill="#fff0a2"/>
+    <path d="M556 370 683 247 700 226 671 235Z" fill="#ffc35d"/>
+  </g>
+
+  <g class="ray ray-slow" opacity=".34">
+    <path d="M700 -16 740 198 700 226 660 198Z" fill="#fff8c6"/>
+    <path d="M700 468 740 254 700 226 660 254Z" fill="#ffbb56"/>
+    <path d="M458 226 672 186 700 226 672 266Z" fill="#fff8c6"/>
+    <path d="M942 226 728 186 700 226 728 266Z" fill="#ffbb56"/>
+  </g>
+
+  <g clip-path="url(#windowClip)" opacity=".88">
+    <rect x="130" y="44" width="1140" height="352" fill="#fff" opacity=".08" filter="url(#glassBlur)"/>
+    <circle cx="700" cy="226" r="220" fill="#fff6bd" opacity=".18" filter="url(#softBlur)"/>
+    <path class="shine" d="M195 64h188l-238 320H-43Z" fill="#fff" opacity=".22"/>
+    <path class="shine" d="M1064 42h82L888 386h-85Z" fill="#fff" opacity=".16" style="animation-delay:-3s"/>
+    <rect width="1400" height="440" fill="url(#grain)" opacity=".45"/>
+  </g>
+
+  <rect x="160" y="72" width="1080" height="296" rx="56" fill="url(#glass)" stroke="url(#edge)" stroke-width="2.5" filter="url(#shadow)"/>
+  <rect x="180" y="92" width="1040" height="256" rx="42" fill="none" stroke="#fff" stroke-opacity=".35"/>
+  <path d="M209 316c151-72 277-23 391-11 168 18 263-76 410-62 98 9 154 44 211 56v49H209Z" fill="#fff" opacity=".07"/>
+
+  <g opacity=".78">
+    <circle class="spark" cx="244" cy="128" r="3" fill="#fff8d3"/>
+    <circle class="spark" cx="325" cy="304" r="2.5" fill="#ffe7a1"/>
+    <circle class="spark" cx="458" cy="116" r="2.2" fill="#fff"/>
+    <circle class="spark" cx="977" cy="124" r="2.8" fill="#fff8d3"/>
+    <circle class="spark" cx="1125" cy="282" r="3.2" fill="#ffe7a1"/>
+    <circle class="spark" cx="1052" cy="320" r="2" fill="#fff"/>
+  </g>
+
+  <g text-anchor="middle">
+    <text x="700" y="211"
+          fill="url(#textGold)"
+          font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+          font-size="82" font-weight="900" letter-spacing="-3"
+          filter="url(#textShadow)">Helios</text>
+    <text x="700" y="239"
+          fill="#ffe8b4"
+          font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+          font-size="17" font-weight="500" letter-spacing="3.8"
+          filter="url(#tagShadow)" opacity=".86">JIT AT THE EDGE · BLAZING LIKE THE SUN</text>
+  </g>
+
+  <!-- Sun-colored badge pills -->
+  <rect x="289" y="260" width="184" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
+  <text x="381" y="280" text-anchor="middle"
+        fill="#ffe496"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="13.5" font-weight="700" letter-spacing=".5"
+        filter="url(#tagShadow)">JIT-at-the-edge</text>
+
+  <rect x="487" y="260" width="202" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
+  <text x="588" y="280" text-anchor="middle"
+        fill="#ffe496"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="13.5" font-weight="700" letter-spacing=".5"
+        filter="url(#tagShadow)">JavaScript Runtime</text>
+
+  <rect x="703" y="260" width="229" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
+  <text x="817" y="280" text-anchor="middle"
+        fill="#ffe496"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="13.5" font-weight="700" letter-spacing=".5"
+        filter="url(#tagShadow)">HTTP/3 · WebTransport</text>
+
+  <rect x="946" y="260" width="166" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
+  <text x="1029" y="280" text-anchor="middle"
+        fill="#ffe496"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="13.5" font-weight="700" letter-spacing=".5"
+        filter="url(#tagShadow)">WASM Snapshots</text>
+
+</svg>

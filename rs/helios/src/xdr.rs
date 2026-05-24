@@ -26,12 +26,14 @@
 //! string itself as the "bytecode" and rehydrating it on decode. The
 //! dispatcher contract is identical in both cases.
 
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 
@@ -90,7 +92,12 @@ impl UserCode {
     /// the same `cache_key` will share a bytecode blob.
     pub fn cache_key(&self) -> String {
         match self {
-            UserCode::Script { file_name, .. } => format!("script:{}", file_name.to_string_lossy()),
+            UserCode::Script { code, file_name } => {
+                let mut hasher = DefaultHasher::new();
+                code.hash(&mut hasher);
+                let digest = hasher.finish();
+                format!("script:{}:{:016x}", file_name.to_string_lossy(), digest)
+            }
             UserCode::Module(p) => format!("module:{}", p.display()),
             UserCode::Directory(p) => format!("dir:{}", p.display()),
             UserCode::Xdr { module_url, .. } => format!("xdr:{module_url}"),
@@ -107,13 +114,13 @@ pub struct XdrEntry {
 }
 
 /// Shared bytecode registry. Populated lazily on first request; readers
-/// (workers) never block writers because we use `DashMap` + `ArcSwap`.
+/// (workers) never block writers because every field is a `DashMap`.
 #[derive(Debug, Default)]
 pub struct XdrCache {
     entries: DashMap<String, XdrEntry>,
-    /// Single source-of-truth for "which bytecode does each worker load on
-    /// boot?". Hot-reload swaps this atomically.
-    active: ArcSwap<Option<XdrEntry>>,
+    /// Per-entry-point active bytecode. Keyed by the same cache key used in
+    /// `entries`. Hot-reload swaps individual entries atomically.
+    active: DashMap<String, Arc<XdrEntry>>,
 }
 
 impl XdrCache {
@@ -125,7 +132,8 @@ impl XdrCache {
     /// inserting the result into the cache.
     ///
     /// Called once on the main thread; the returned `XdrEntry` is then
-    /// distributed to every worker.
+    /// distributed to every worker. Also sets this entry as active for
+    /// its cache key; use [`XdrCache::set_active`] to override explicitly.
     pub fn compile_user_code<E: JsEngineBackend>(
         &self,
         engine: &E,
@@ -146,14 +154,17 @@ impl XdrCache {
                 (src, format!("file://{}", p.display()))
             }
             UserCode::Directory(p) => {
-                // Convention: directory entry point is `index.js` or `main.js`.
+                // Convention: directory entry point is resolved in this order:
+                // index.js → main.js → worker.js. The first file that exists
+                // wins; remaining candidates are ignored.
                 let candidates = ["index.js", "main.js", "worker.js"];
                 let entry = candidates
                     .iter()
                     .map(|n| p.join(n))
                     .find(|p| p.exists())
                     .with_context(|| format!("No entry point found in {}", p.display()))?;
-                let src = std::fs::read_to_string(&entry)?;
+                let src = std::fs::read_to_string(&entry)
+                    .with_context(|| format!("Failed to read entry point {}", entry.display()))?;
                 (src, format!("file://{}", entry.display()))
             }
             UserCode::Xdr {
@@ -165,8 +176,8 @@ impl XdrCache {
                     bytecode: bytecode.clone(),
                     module_url: module_url.clone(),
                 };
-                self.entries.insert(key, entry.clone());
-                self.active.store(Arc::new(Some(entry.clone())));
+                self.entries.insert(key.clone(), entry.clone());
+                self.active.insert(key, Arc::new(entry.clone()));
                 return Ok(entry);
             }
         };
@@ -178,14 +189,32 @@ impl XdrCache {
             bytecode: xdr,
             module_url,
         };
-        self.entries.insert(key, entry.clone());
-        self.active.store(Arc::new(Some(entry.clone())));
+        self.entries.insert(key.clone(), entry.clone());
+        self.active.insert(key, Arc::new(entry.clone()));
         Ok(entry)
     }
 
-    /// Snapshot the currently active entry, if any.
-    pub fn active(&self) -> Option<XdrEntry> {
-        self.active.load_full().as_ref().clone()
+    /// Explicitly set the active entry for a given cache key.
+    pub fn set_active(&self, key: &str, entry: XdrEntry) {
+        self.active.insert(key.to_owned(), Arc::new(entry));
+    }
+
+    /// Snapshot the currently active entry for the given cache key, if any.
+    pub fn active(&self, key: &str) -> Option<XdrEntry> {
+        self.active.get(key).map(|e| e.as_ref().clone())
+    }
+
+    /// Return the single active entry, or `None` if zero or more than one
+    /// module is active. When multiple modules are compiled, use
+    /// [`XdrCache::active`] to address a specific key.
+    ///
+    /// Returning `None` for the multi-module case prevents non-deterministic
+    /// module selection during warm-boot.
+    pub fn first_active(&self) -> Option<XdrEntry> {
+        if self.active.len() != 1 {
+            return None;
+        }
+        self.active.iter().next().map(|e| e.value().as_ref().clone())
     }
 
     /// Number of cached compilations.
@@ -198,10 +227,10 @@ impl XdrCache {
     }
 }
 
-/// Extension trait kept for backward compat — every backend now provides
-/// `compile_to_xdr` directly on [`JsEngineBackend`]. Implementors that
-/// want a custom XDR-only adapter can implement [`XdrCompiler`] and
-/// expose it via a wrapper engine.
+/// Extension trait for backends that expose a standalone XDR compilation
+/// step separate from full module evaluation. Implementors that want a
+/// custom XDR-only adapter can implement [`XdrCompiler`] and expose it
+/// via a wrapper engine.
 pub trait XdrCompiler: Send + Sync {
     fn compile(&self, source: &str, module_url: &str) -> Result<Arc<[u8]>, JsError>;
 }
@@ -218,7 +247,7 @@ pub trait XdrCompiler: Send + Sync {
 /// SpiderMonkey.
 #[derive(Default)]
 pub struct StubEngine {
-    next_handle: parking_lot::Mutex<u32>,
+    next_handle: AtomicU32,
     modules: DashMap<u32, ()>,
 }
 
@@ -235,10 +264,11 @@ impl StubEngine {
         Self::default()
     }
 
-    fn alloc_handle(&self) -> u32 {
-        let mut g = self.next_handle.lock();
-        *g = g.checked_add(1).expect("handle overflow");
-        *g
+    fn alloc_handle(&self) -> Result<u32, JsError> {
+        self.next_handle
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map(|prev| prev + 1)
+            .map_err(|_| JsError::msg("module handle counter overflowed u32"))
     }
 }
 
@@ -246,7 +276,7 @@ const STUB_MAGIC: &[u8] = b"HXDR";
 
 impl JsEngineBackend for StubEngine {
     fn eval_module(&self, _source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
-        let h = self.alloc_handle();
+        let h = self.alloc_handle()?;
         self.modules.insert(h, ());
         Ok(ModuleHandle(h))
     }
@@ -321,16 +351,31 @@ mod spidermonkey_backend {
     //! Phase 2 for the contract.
 
     use super::*;
+    use std::marker::PhantomData;
 
     /// Production engine backed by the spiderfire `Runtime`. Each worker
     /// thread owns one of these; the underlying SpiderMonkey JS context
     /// is thread-pinned (per WinterJS convention).
+    ///
+    /// **`Send` + `Sync` status:**  This struct is currently `Send` and
+    /// `Sync` because it is a no-op stub with no interior mutable state.
+    /// The `PhantomData<*const ()>` field is kept intentionally so that
+    /// auto-`Sync` is suppressed the moment any real SpiderMonkey pointer
+    /// or `RefCell` is added.  At that point the explicit
+    /// `unsafe impl Sync` below **must be removed** and the dispatcher
+    /// restructured to use per-thread engines.
     pub struct SpiderMonkeyEngine {
         // Holds spiderfire `runtime::Runtime` + a `module-handle -> JS root`
-        // table guarded by an internal `RefCell` — single-threaded inside,
-        // `Send + Sync` across because we never hand the runtime out.
-        _private: (),
+        // table guarded by an internal `RefCell` — single-threaded inside.
+        _not_sync: PhantomData<*const ()>,
     }
+
+    // SAFETY: Both Send and Sync are safe for the current no-op stub.
+    // PhantomData<*const ()> suppresses auto-Sync so these impls are
+    // explicit and must be reviewed when real SpiderMonkey state is added.
+    // Remove `unsafe impl Sync` once the struct holds thread-pinned state.
+    unsafe impl Send for SpiderMonkeyEngine {}
+    unsafe impl Sync for SpiderMonkeyEngine {}
 
     impl std::fmt::Debug for SpiderMonkeyEngine {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -348,21 +393,21 @@ mod spidermonkey_backend {
             //    sandbox without PROT_EXEC pages).
             // 3. Install standard WinterCG modules + the helios builtins
             //    (webtransport, etc).
-            Ok(Self { _private: () })
+            Ok(Self { _not_sync: PhantomData })
         }
     }
 
     impl JsEngineBackend for SpiderMonkeyEngine {
         fn eval_module(&self, _source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
-            unimplemented!("link mozjs to enable")
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
 
         fn eval_xdr(&self, _xdr: Arc<[u8]>, _module_url: &str) -> Result<ModuleHandle, JsError> {
-            unimplemented!("link mozjs to enable")
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
 
         fn call_fetch_handler(&self, _h: ModuleHandle, _b: Bytes) -> Result<Bytes, JsError> {
-            unimplemented!("link mozjs to enable")
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
 
         fn drain_microtasks(&self, _h: ModuleHandle) -> Result<(), JsError> {
@@ -371,14 +416,7 @@ mod spidermonkey_backend {
         fn drop_module(&self, _h: ModuleHandle) {}
 
         fn compile_to_xdr(&self, _source: &str, _module_url: &str) -> Result<Arc<[u8]>, JsError> {
-            // Real impl:
-            //   let cx = self.cx();
-            //   rooted!(in(cx) let mut script = ptr::null_mut());
-            //   JS::CompileUtf8(cx, opts, source) -> script;
-            //   let mut xdr = mozjs::jsapi::TranscodeBuffer::new();
-            //   JS::EncodeScript(cx, &mut xdr, script);
-            //   Ok(Arc::from(xdr.into_vec().as_slice()))
-            unimplemented!("link mozjs to enable")
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
     }
 }

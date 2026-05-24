@@ -30,7 +30,7 @@ struct Response {
     # Set when the JS handler returned a streaming ReadableStream; the host
     # then pulls additional chunks via a follow-up `pull-body` call.
     streaming @3 :Bool;
-    stream-handle @4 :UInt32;
+    streamHandle @4 :UInt32;
 }
 
 struct JsError {

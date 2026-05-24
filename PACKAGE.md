@@ -1,6 +1,6 @@
 # Helios public package
 
-Version: v1.0.0-alpha
+Version: v1.1.0-beta
 Target: x86_64-unknown-linux-gnu
 
 Contents:

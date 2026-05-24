@@ -48,6 +48,7 @@ interface js-engine {
     gc-minor: func(handle: module-handle);
 
     /// Drop a module handle and free its associated SpiderMonkey roots.
+    /// Calling this with an unknown or already-dropped handle is a no-op.
     drop-module: func(handle: module-handle);
 }
 

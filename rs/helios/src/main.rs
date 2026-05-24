@@ -210,7 +210,7 @@ async fn cmd_serve(s: Serve) -> Result<()> {
     cache.compile_user_code(bootstrap_engine.as_ref(), &user_code)?;
 
     let entry = cache
-        .active()
+        .first_active()
         .ok_or_else(|| anyhow::anyhow!("compiled module missing from XDR cache"))?;
     let inline_handle = bootstrap_engine
         .eval_xdr(entry.bytecode.clone(), &entry.module_url)

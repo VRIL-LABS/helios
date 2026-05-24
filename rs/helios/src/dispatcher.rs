@@ -398,7 +398,7 @@ where
 
     // Boot: if the cache has an active entry, eval it now so the very
     // first request finds the module ready.
-    if let Some(entry) = cache.active() {
+    if let Some(entry) = cache.first_active() {
         match engine.eval_xdr(entry.bytecode.clone(), &entry.module_url) {
             Ok(h) => {
                 handle = Some(h);

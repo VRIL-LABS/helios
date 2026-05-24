@@ -25,13 +25,14 @@ curl http://127.0.0.1:8080/
 
 ### Build from source
 
+Requires Rust 1.75 or newer.
+
 ```sh
 cd rs
-cargo build --release -p helios
-./target/release/helios serve bench/helios-simple.js --port 8080
+cargo build --release
+cd ..
+./rs/target/release/helios serve bench/helios-simple.js --port 8080
 ```
-
-Requires Rust 1.75 or newer.
 
 ## Writing a handler
 

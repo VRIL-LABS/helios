@@ -64,6 +64,16 @@
       <stop offset="100%" stop-color="#ff8000" stop-opacity=".16"/>
     </linearGradient>
 
+    <radialGradient id="achieveBadge" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#ffe566" stop-opacity=".97"/>
+      <stop offset="55%" stop-color="#ff9100" stop-opacity=".93"/>
+      <stop offset="100%" stop-color="#c94800" stop-opacity=".88"/>
+    </radialGradient>
+
+    <filter id="achieveGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="#ffaa00" flood-opacity=".82"/>
+    </filter>
+
     <clipPath id="windowClip">
       <rect x="160" y="72" width="1080" height="296" rx="56"/>
     </clipPath>
@@ -227,5 +237,39 @@
         font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
         font-size="13.5" font-weight="700" letter-spacing=".5"
         filter="url(#tagShadow)">WASM Snapshots</text>
+
+  <!-- Achievement starburst badges -->
+  <polygon points="262,101 276,120 300,117 297,141 316,155 297,170 300,193 276,190 262,209 248,190 224,193 227,170 208,155 227,141 224,117 248,120"
+           fill="url(#achieveBadge)" stroke="#ffd040" stroke-width="2" filter="url(#achieveGlow)"/>
+  <circle cx="262" cy="155" r="38" fill="none" stroke="#fff" stroke-width="1.5" stroke-opacity=".35"/>
+  <text x="262" y="148" text-anchor="middle"
+        fill="#fff8e0"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="20" font-weight="900" letter-spacing="-.5"
+        filter="url(#tagShadow)">160k+</text>
+  <text x="262" y="164" text-anchor="middle"
+        fill="#fff8e0"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="13.5" font-weight="800" letter-spacing=".5"
+        filter="url(#tagShadow)">Req/s!</text>
+  <text x="262" y="178" text-anchor="middle"
+        fill="#ffe4a0"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="8.5" font-weight="500" letter-spacing=".3"
+        filter="url(#tagShadow)">with 256 connections</text>
+
+  <polygon points="1138,101 1152,120 1176,117 1173,141 1192,155 1173,170 1176,193 1152,190 1138,209 1124,190 1100,193 1103,170 1084,155 1103,141 1100,117 1124,120"
+           fill="url(#achieveBadge)" stroke="#ffd040" stroke-width="2" filter="url(#achieveGlow)"/>
+  <circle cx="1138" cy="155" r="38" fill="none" stroke="#fff" stroke-width="1.5" stroke-opacity=".35"/>
+  <text x="1138" y="150" text-anchor="middle"
+        fill="#fff8e0"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="19" font-weight="900" letter-spacing="-.5"
+        filter="url(#tagShadow)">~0.4ms</text>
+  <text x="1138" y="167" text-anchor="middle"
+        fill="#fff8e0"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="13.5" font-weight="800" letter-spacing=".5"
+        filter="url(#tagShadow)">Latency!</text>
 
 </svg>

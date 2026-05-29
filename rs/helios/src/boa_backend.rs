@@ -11,15 +11,20 @@
 //! * `addEventListener('fetch', handler)` — registers a fetch handler.
 //! * `Response(body, init?)` — constructs a response with optional status/headers.
 //! * `event.respondWith(response)` — sets the response for the current request.
-//! * `Request` — basic request object with `method`, `url`, `headers` properties.
+//! * `Request` — basic request object with `method`, `url`, `headers`, `body` properties.
+//!   `body` is a `Uint8Array` to preserve binary payloads faithfully.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use boa_engine::{
     js_string, Context, JsArgs, JsNativeError, JsObject, JsResult, JsString, JsValue,
     NativeFunction, Source,
 };
+use boa_engine::object::builtins::JsUint8Array;
+use boa_engine::property::PropertyKey;
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -34,18 +39,44 @@ struct CapturedResponse {
     body: Vec<u8>,
 }
 
-/// Per-module state: the source code and any compiled state.
+/// Per-module state: the source code.
 struct ModuleState {
     source: String,
-    module_url: String,
 }
+
+/// Per-worker-thread context: a long-lived Boa `Context` with the Workers API and
+/// user script already installed, plus the response-capture channel reused across
+/// requests from the same thread.
+struct WorkerContext {
+    context: Context,
+    response_capture: Arc<Mutex<Option<CapturedResponse>>>,
+}
+
+thread_local! {
+    /// Per-thread cache mapping `(engine_id, handle_id)` to an initialised worker context.
+    /// Each dispatcher worker thread owns its own entry, so the script is parsed and
+    /// evaluated only once per thread rather than on every request.
+    static WORKER_CONTEXTS: RefCell<HashMap<(u64, u32), WorkerContext>> =
+        RefCell::new(HashMap::new());
+}
+
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Boa-based JS engine that actually executes JavaScript handlers.
 ///
-/// Each call to `eval_module` parses and evaluates the source, registering
-/// any `addEventListener('fetch', ...)` callback. `call_fetch_handler`
-/// invokes that callback with a request object and captures the response.
+/// Each call to `eval_module` validates the source by installing the Workers API and
+/// evaluating it in a temporary context, surfacing parse/top-level errors before the
+/// server starts serving traffic.  `call_fetch_handler` lazily initialises a
+/// per-thread [`WorkerContext`] on the first call from a given thread and reuses it
+/// for all subsequent requests, avoiding the cost of re-parsing the script per request.
+///
+/// # Thread safety
+///
+/// `BoaEngine` contains only `u64`, `AtomicU32`, and `DashMap<u32, ModuleState>`
+/// where `ModuleState` holds two `String`s.  All of these are `Send + Sync`, so
+/// both auto-traits are derived automatically — no manual `unsafe impl` required.
 pub struct BoaEngine {
+    engine_id: u64,
     next_handle: AtomicU32,
     modules: DashMap<u32, ModuleState>,
 }
@@ -53,6 +84,7 @@ pub struct BoaEngine {
 impl std::fmt::Debug for BoaEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BoaEngine")
+            .field("engine_id", &self.engine_id)
             .field("modules", &self.modules.len())
             .finish()
     }
@@ -61,6 +93,7 @@ impl std::fmt::Debug for BoaEngine {
 impl BoaEngine {
     pub fn new() -> Self {
         Self {
+            engine_id: NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
             next_handle: AtomicU32::new(0),
             modules: DashMap::new(),
         }
@@ -73,70 +106,8 @@ impl BoaEngine {
             .map_err(|_| JsError::msg("module handle counter overflowed u32"))
     }
 
-    /// Execute JS source in a fresh Boa context, calling the fetch handler
-    /// with the given request data and returning the captured response.
-    fn execute_fetch(
-        &self,
-        source: &str,
-        _module_url: &str,
-        method: &str,
-        url: &str,
-        headers: &[(String, String)],
-        body: &[u8],
-    ) -> Result<CapturedResponse, JsError> {
-        let response: Arc<Mutex<Option<CapturedResponse>>> = Arc::new(Mutex::new(None));
-
-        let mut context = Context::default();
-
-        // Install the Workers API globals
-        self.install_workers_api(&mut context, response.clone())
-            .map_err(|e| JsError::msg(format!("failed to install Workers API: {e}")))?;
-
-        // Evaluate the user script
-        context
-            .eval(Source::from_bytes(source.as_bytes()))
-            .map_err(|e| JsError::msg(format!("script evaluation failed: {e}")))?;
-
-        // Get the registered fetch handler
-        let fetch_handler = context
-            .global_object()
-            .get(js_string!("__helios_fetch_handler"), &mut context)
-            .map_err(|e| JsError::msg(format!("failed to get fetch handler: {e}")))?;
-
-        if fetch_handler.is_undefined() || fetch_handler.is_null() {
-            return Err(JsError::msg(
-                "no fetch handler registered (call addEventListener('fetch', handler))",
-            ));
-        }
-
-        let handler_fn = fetch_handler
-            .as_callable()
-            .ok_or_else(|| JsError::msg("fetch handler is not callable"))?;
-
-        // Create the request/event object
-        let event = self
-            .create_fetch_event(&mut context, method, url, headers, body, response.clone())
-            .map_err(|e| JsError::msg(format!("failed to create fetch event: {e}")))?;
-
-        // Call the handler
-        handler_fn
-            .call(&JsValue::undefined(), &[event.into()], &mut context)
-            .map_err(|e| JsError::msg(format!("fetch handler threw: {e}")))?;
-
-        // Extract the response
-        let captured = response.lock().take().ok_or_else(|| {
-            JsError::msg("fetch handler did not call event.respondWith()")
-        })?;
-
-        Ok(captured)
-    }
-
-    /// Install minimal Workers API: addEventListener, Response, Request
-    fn install_workers_api(
-        &self,
-        context: &mut Context,
-        _response_capture: Arc<Mutex<Option<CapturedResponse>>>,
-    ) -> JsResult<()> {
+    /// Install minimal Workers API: `addEventListener` and the `Response` constructor.
+    fn install_workers_api(context: &mut Context) -> JsResult<()> {
         // addEventListener('fetch', handler) — stores handler in a global
         let add_event_listener =
             NativeFunction::from_copy_closure(move |_this, args, ctx| {
@@ -161,8 +132,7 @@ impl BoaEngine {
         )?;
 
         // Response constructor: new Response(body, init?)
-        // Register as a callable constructor using eval to define a JS function
-        // that acts as both a constructor and a regular function.
+        // Defined via eval so it acts as a true constructor that works with `instanceof`.
         context.eval(Source::from_bytes(
             br#"
             function Response(body, init) {
@@ -191,9 +161,11 @@ impl BoaEngine {
         Ok(())
     }
 
-    /// Create a fetch event object with respondWith() method
+    /// Create a fetch event object with a `respondWith()` method for this request.
+    ///
+    /// The `response_capture` arc is shared with the worker context so that
+    /// `respondWith` can store the response for retrieval after the handler returns.
     fn create_fetch_event(
-        &self,
         context: &mut Context,
         method: &str,
         url: &str,
@@ -219,13 +191,13 @@ impl BoaEngine {
         }
         request.set(js_string!("headers"), JsValue::from(headers_obj), false, context)?;
 
-        let body_str = String::from_utf8_lossy(body);
-        request.set(
-            js_string!("body"),
-            js_string!(body_str.as_ref()),
-            false,
-            context,
-        )?;
+        // Expose body as a Uint8Array so binary payloads are preserved faithfully.
+        let body_array = JsUint8Array::from_iter(body.iter().copied(), context)
+            .map_err(|e| {
+                JsNativeError::typ()
+                    .with_message(format!("failed to create body Uint8Array: {e}"))
+            })?;
+        request.set(js_string!("body"), body_array, false, context)?;
 
         event.set(js_string!("request"), JsValue::from(request), false, context)?;
 
@@ -255,11 +227,15 @@ impl BoaEngine {
                 let mut headers = Vec::new();
                 let headers_val = resp_obj.get(js_string!("headers"), ctx)?;
                 if let Some(h_obj) = headers_val.as_object() {
-                    // Try to enumerate own properties
+                    // Only collect string-keyed properties; symbol and index keys are
+                    // not valid HTTP header names and are skipped.
                     let keys = h_obj.own_property_keys(ctx)?;
                     for key in keys {
-                        let k_str = format!("{}", key);
-                        let v = h_obj.get(key.clone(), ctx)?;
+                        let k_str = match &key {
+                            PropertyKey::String(s) => s.to_std_string_escaped(),
+                            _ => continue,
+                        };
+                        let v = h_obj.get(key, ctx)?;
                         let v_str = v.to_string(ctx)?.to_std_string_escaped();
                         headers.push((k_str, v_str));
                     }
@@ -353,25 +329,23 @@ fn read_str(b: &[u8], p: &mut usize) -> Option<String> {
     Some(String::from_utf8_lossy(bytes).into_owned())
 }
 
-// SAFETY: BoaEngine only contains atomics and DashMap (both Send+Sync).
-// The actual Boa Context is created fresh per call (not stored).
-unsafe impl Send for BoaEngine {}
-unsafe impl Sync for BoaEngine {}
-
 impl JsEngineBackend for BoaEngine {
-    fn eval_module(&self, source: &str, module_url: &str) -> Result<ModuleHandle, JsError> {
-        // Validate the source by doing a trial parse
+    fn eval_module(&self, source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
+        // Validate at startup: install the Workers API and evaluate the actual source so
+        // that parse errors and top-level exceptions surface before the server starts
+        // accepting requests (fail-fast property of the eval_module entry point).
         let mut context = Context::default();
+        Self::install_workers_api(&mut context)
+            .map_err(|e| JsError::msg(format!("Workers API install failed: {e}")))?;
         context
-            .eval(Source::from_bytes(b""))
-            .map_err(|e| JsError::msg(format!("context init failed: {e}")))?;
+            .eval(Source::from_bytes(source.as_bytes()))
+            .map_err(|e| JsError::msg(format!("script evaluation failed: {e}")))?;
 
         let h = self.alloc_handle()?;
         self.modules.insert(
             h,
             ModuleState {
                 source: source.to_string(),
-                module_url: module_url.to_string(),
             },
         );
         Ok(ModuleHandle(h))
@@ -396,24 +370,100 @@ impl JsEngineBackend for BoaEngine {
         handle: ModuleHandle,
         req_bytes: Bytes,
     ) -> Result<Bytes, JsError> {
-        let module = self
-            .modules
-            .get(&handle.0)
-            .ok_or_else(|| JsError::msg(format!("unknown handle {}", handle.0)))?;
-
+        let handle_id = handle.0;
         let (method, url, headers, body) =
             Self::decode_request(&req_bytes).unwrap_or_else(|| {
                 ("GET".to_string(), "/".to_string(), vec![], vec![])
             });
 
-        let resp = self.execute_fetch(
-            &module.source,
-            &module.module_url,
-            &method,
-            &url,
-            &headers,
-            &body,
-        )?;
+        let engine_id = self.engine_id;
+
+        let resp = WORKER_CONTEXTS.with(|cache| -> Result<CapturedResponse, JsError> {
+            let mut cache = cache.borrow_mut();
+            let key = (engine_id, handle_id);
+
+            // Lazy-initialise the per-thread worker context for this handle.
+            // The Context is built once per thread and reused across all subsequent
+            // requests, avoiding a full parse+eval cycle on every call.
+            if !cache.contains_key(&key) {
+                let source = {
+                    let module = self.modules.get(&handle_id)
+                        .ok_or_else(|| JsError::msg(format!("unknown handle {}", handle_id)))?;
+                    module.source.clone()
+                };
+
+                let response_capture: Arc<Mutex<Option<CapturedResponse>>> =
+                    Arc::new(Mutex::new(None));
+                let mut context = Context::default();
+
+                Self::install_workers_api(&mut context)
+                    .map_err(|e| JsError::msg(format!("failed to install Workers API: {e}")))?;
+
+                context
+                    .eval(Source::from_bytes(source.as_bytes()))
+                    .map_err(|e| JsError::msg(format!("script evaluation failed: {e}")))?;
+
+                // Verify that the script registered a fetch handler.
+                let handler = context
+                    .global_object()
+                    .get(js_string!("__helios_fetch_handler"), &mut context)
+                    .map_err(|e| JsError::msg(format!("failed to get fetch handler: {e}")))?;
+
+                if handler.is_undefined() || handler.is_null() {
+                    return Err(JsError::msg(
+                        "no fetch handler registered (call addEventListener('fetch', handler))",
+                    ));
+                }
+
+                cache.insert(key, WorkerContext { context, response_capture });
+            }
+
+            let wctx = cache.get_mut(&key).unwrap();
+
+            // Clear any response left over from the previous call (should already be
+            // None after the `take()` below, but guard against unexpected re-entry).
+            *wctx.response_capture.lock() = None;
+
+            // Retrieve the cached fetch handler from the long-lived context.
+            let fetch_handler = wctx
+                .context
+                .global_object()
+                .get(js_string!("__helios_fetch_handler"), &mut wctx.context)
+                .map_err(|e| JsError::msg(format!("failed to get fetch handler: {e}")))?;
+
+            if fetch_handler.is_undefined() || fetch_handler.is_null() {
+                return Err(JsError::msg("no fetch handler registered"));
+            }
+
+            let handler_fn = fetch_handler
+                .as_callable()
+                .ok_or_else(|| JsError::msg("fetch handler is not callable"))?
+                .clone();
+
+            // Build a fresh event object for this request.  Creating new JsObjects is
+            // cheap compared to re-parsing the script; the GC reclaims them after the call.
+            let response_capture = wctx.response_capture.clone();
+            let event = Self::create_fetch_event(
+                &mut wctx.context,
+                &method,
+                &url,
+                &headers,
+                &body,
+                response_capture,
+            )
+            .map_err(|e| JsError::msg(format!("failed to create fetch event: {e}")))?;
+
+            handler_fn
+                .call(&JsValue::undefined(), &[event.into()], &mut wctx.context)
+                .map_err(|e| JsError::msg(format!("fetch handler threw: {e}")))?;
+
+            let result = wctx
+                .response_capture
+                .lock()
+                .take()
+                .ok_or_else(|| JsError::msg("fetch handler did not call event.respondWith()"));
+            result
+        })?;
 
         Ok(Self::encode_response(&resp))
     }
@@ -424,6 +474,12 @@ impl JsEngineBackend for BoaEngine {
 
     fn drop_module(&self, handle: ModuleHandle) {
         self.modules.remove(&handle.0);
+        // Also remove the cached worker context for the current thread so the
+        // memory is reclaimed promptly on the thread that owns it.
+        let key = (self.engine_id, handle.0);
+        WORKER_CONTEXTS.with(|cache| {
+            cache.borrow_mut().remove(&key);
+        });
     }
 
     fn compile_to_xdr(&self, source: &str, _module_url: &str) -> Result<Arc<[u8]>, JsError> {

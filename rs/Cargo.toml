@@ -59,8 +59,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # --- JS execution engine (Boa) ---
 boa_engine = { version = "0.21", features = ["annex-b"] }
-boa_gc = "0.21"
-boa_runtime = "0.21"
 
 # --- Misc ---
 anyhow = "1"

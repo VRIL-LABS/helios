@@ -301,6 +301,13 @@ async fn cmd_bench(b: Bench) -> Result<()> {
     Ok(())
 }
 
-fn cmd_exec(_e: Exec) -> Result<()> {
-    anyhow::bail!("`helios exec` requires the `spidermonkey` feature");
+fn cmd_exec(e: Exec) -> Result<()> {
+    let source = std::fs::read_to_string(&e.js_path)
+        .map_err(|err| anyhow::anyhow!("failed to read {}: {err}", e.js_path.display()))?;
+    let module_url = e.js_path.display().to_string();
+    let engine = BoaEngine::new();
+    engine
+        .eval_module(&source, &module_url)
+        .map_err(|err| anyhow::anyhow!("exec failed: {err}"))?;
+    Ok(())
 }

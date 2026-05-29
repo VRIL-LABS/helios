@@ -283,21 +283,21 @@ impl BoaEngine {
 
         // Detect Promise values: if the argument is a Promise, drive the
         // microtask queue until it settles, then extract the resolved value.
-        let resp_obj = if JsPromise::from_object(resp_obj.clone()).is_ok() {
-            let promise = JsPromise::from_object(resp_obj.clone()).unwrap();
-            // Drive the microtask/job queue so the promise can settle.
-            context.run_jobs().map_err(|e| {
-                JsError::msg(format!("error running jobs for async handler: {e}"))
-            })?;
-            match promise.state() {
-                boa_engine::builtins::promise::PromiseState::Fulfilled(val) => {
-                    val.as_object().ok_or_else(|| {
-                        JsError::msg("async fetch handler resolved with a non-object value")
-                    })?.clone()
-                }
-                boa_engine::builtins::promise::PromiseState::Rejected(val) => {
-                    return Err(JsError::msg(format!(
-                        "async fetch handler rejected: {}",
+        let resp_obj = match JsPromise::from_object(resp_obj.clone()) {
+            Ok(promise) => {
+                // Drive the microtask/job queue so the promise can settle.
+                context.run_jobs().map_err(|e| {
+                    JsError::msg(format!("error running jobs for async handler: {e}"))
+                })?;
+                match promise.state() {
+                    boa_engine::builtins::promise::PromiseState::Fulfilled(val) => {
+                        val.as_object().ok_or_else(|| {
+                            JsError::msg("async fetch handler resolved with a non-object value")
+                        })?.clone()
+                    }
+                    boa_engine::builtins::promise::PromiseState::Rejected(val) => {
+                        return Err(JsError::msg(format!(
+                            "async fetch handler rejected: {}",
                         val.display()
                     )));
                 }
@@ -308,8 +308,8 @@ impl BoaEngine {
                     ));
                 }
             }
-        } else {
-            resp_obj.clone()
+            }
+            Err(_) => resp_obj.clone(),
         };
 
         let status = resp_obj
@@ -439,7 +439,7 @@ impl JsEngineBackend for BoaEngine {
             .map_err(|e| JsError::msg(format!("script evaluation failed: {e}")))?;
 
         let h = self.alloc_handle()?;
-        let gen = MODULE_GENERATION.load(Ordering::Relaxed);
+        let gen = MODULE_GENERATION.load(Ordering::Acquire);
         self.modules.insert(
             h,
             ModuleState {
@@ -484,10 +484,13 @@ impl JsEngineBackend for BoaEngine {
 
             // Evict stale entries: only consult the global registry when the global
             // generation counter has advanced since this context was built (fast path:
-            // a single atomic load that almost always matches).
+            // a single relaxed atomic load that almost always matches).
             if let Some(wctx) = cache.get(&key) {
-                let current_gen = MODULE_GENERATION.load(Ordering::Acquire);
+                let current_gen = MODULE_GENERATION.load(Ordering::Relaxed);
                 if current_gen != wctx.generation {
+                    // Generation changed; use Acquire to synchronize with the Release
+                    // in drop_module before consulting ACTIVE_HANDLES.
+                    let _synced_gen = MODULE_GENERATION.load(Ordering::Acquire);
                     let still_active = ACTIVE_HANDLES
                         .get(&key)
                         .map(|g| *g == wctx.generation)

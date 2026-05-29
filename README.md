@@ -44,12 +44,14 @@ addEventListener('fetch', (event) => {
 });
 ```
 
+> **Note:** In this build, the SpiderMonkey JS engine is not yet enabled. The server uses a stub engine that returns `{"ok":true}` for every request regardless of the handler source. The handler above will be executed once full JS execution is enabled.
+
 See [`bench/helios-simple.js`](bench/helios-simple.js) for a minimal example and [`bench/complex.js`](bench/complex.js) for a more involved one.
 
 ## CLI reference
 
 ```text
-helios serve <app.js> [--port 8080] [--workers N] [--policy round-robin|least-loaded|power-of-two]
+helios serve <app.js> [-s] [--port 8080] [--workers N] [--policy round-robin|least-loaded|power-of-two]
                       [--ip ADDR] [--cert PATH --key PATH]
                       [--alt-svc 'h3=":8443"; ma=86400']
                       [--shutdown-timeout 60]
@@ -61,12 +63,13 @@ helios bench <url>    [-d 30] [--warmup 3] [-c 64] [-R 50000]
                       [--http auto|http1|http2|http3]
                       [--body-file FILE] [--json]
 
-helios exec  <script.js>
+helios exec  <script.js> [-s]
 ```
 
 **Notes:**
 
 - `helios serve` fans requests across worker threads using a lock-free dispatcher. Default dispatch policy is `power-of-two`.
+- `-s` / `--script` runs the JS file in script mode (no module resolution). Applies to both `helios serve` and `helios exec`.
 - HTTP/3 requires a TLS certificate and key (`--cert` / `--key`) because QUIC mandates TLS 1.3. The `--alt-svc` flag sets the `Alt-Svc` response header to advertise the H3 endpoint to clients.
 - `helios build` invokes [Wizer](https://github.com/bytecodealliance/wizer) to produce a pre-initialized WASM snapshot. Requires `wizer` on `PATH` and a compatible `helios-worker.wasm` component. `wasm-opt` is also required unless `--no-opt` is passed.
 - `helios exec` requires the SpiderMonkey backend (not yet enabled in this build).
@@ -91,8 +94,9 @@ helios exec  <script.js>
 For runtime comparisons, use the provided parity servers with the same flags:
 
 ```sh
-node bench/node-simple.js   # port 3000
-bun  bench/bun-simple.js    # port 3001
+# These servers also listen on port 8080; stop helios (or use a different port) before running them.
+node bench/node-simple.js   # port 8080
+bun  bench/bun-simple.js    # port 8080
 ```
 
 ## Repository contents

@@ -23,7 +23,7 @@ use boa_engine::{
     js_string, Context, JsArgs, JsNativeError, JsObject, JsResult, JsString, JsValue,
     NativeFunction, Source,
 };
-use boa_engine::object::builtins::JsUint8Array;
+use boa_engine::object::builtins::{JsPromise, JsUint8Array};
 use boa_engine::property::PropertyKey;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -39,9 +39,11 @@ struct CapturedResponse {
     body: Vec<u8>,
 }
 
-/// Per-module state: the source code.
+/// Per-module state: the source code and a generation counter used to signal
+/// when a module has been dropped (invalidating cached worker contexts).
 struct ModuleState {
     source: String,
+    generation: u64,
 }
 
 /// Per-worker-thread context: a long-lived Boa `Context` with the Workers API and
@@ -50,7 +52,21 @@ struct ModuleState {
 struct WorkerContext {
     context: Context,
     response_capture: Arc<Mutex<Option<CapturedResponse>>>,
+    /// The generation at which this context was created; if the engine's generation
+    /// for this handle has advanced, this context is stale and must be evicted.
+    generation: u64,
 }
+
+/// Global generation counter incremented each time a module is dropped.  Worker
+/// threads compare this against their cached `WorkerContext::generation` and evict
+/// stale entries.
+static MODULE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// A set of currently-active handle IDs per engine.  When `drop_module` removes a
+/// handle from this set, worker threads will detect the missing entry on their next
+/// access and evict the corresponding cached context.
+static ACTIVE_HANDLES: std::sync::LazyLock<DashMap<(u64, u32), u64>> =
+    std::sync::LazyLock::new(DashMap::new);
 
 thread_local! {
     /// Per-thread cache mapping `(engine_id, handle_id)` to an initialised worker context.
@@ -69,6 +85,11 @@ static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(0);
 /// server starts serving traffic.  `call_fetch_handler` lazily initialises a
 /// per-thread [`WorkerContext`] on the first call from a given thread and reuses it
 /// for all subsequent requests, avoiding the cost of re-parsing the script per request.
+///
+/// When a module is dropped via `drop_module`, its entry is removed from the global
+/// `ACTIVE_HANDLES` map and the generation counter is bumped.  Worker threads detect
+/// stale entries by comparing generations on the next access and evict them, ensuring
+/// no unbounded leak of Boa contexts across threads.
 ///
 /// # Thread safety
 ///
@@ -212,6 +233,44 @@ impl BoaEngine {
                     JsNativeError::typ().with_message("respondWith expects a Response object")
                 })?;
 
+                // Detect Promise values: if the argument is a Promise, drive the
+                // microtask queue until it settles, then extract the resolved value.
+                let resp_obj = if JsPromise::from_object(resp_obj.clone()).is_ok() {
+                    let promise = JsPromise::from_object(resp_obj.clone()).unwrap();
+                    // Drive the microtask/job queue so the promise can settle.
+                    ctx.run_jobs().map_err(|e| {
+                        JsNativeError::typ()
+                            .with_message(format!("error running jobs for async handler: {e}"))
+                    })?;
+                    match promise.state() {
+                        boa_engine::builtins::promise::PromiseState::Fulfilled(val) => {
+                            val.as_object().ok_or_else(|| {
+                                JsNativeError::typ().with_message(
+                                    "async fetch handler resolved with a non-object value",
+                                )
+                            })?.clone()
+                        }
+                        boa_engine::builtins::promise::PromiseState::Rejected(val) => {
+                            return Err(JsNativeError::typ()
+                                .with_message(format!(
+                                    "async fetch handler rejected: {}",
+                                    val.display()
+                                ))
+                                .into());
+                        }
+                        boa_engine::builtins::promise::PromiseState::Pending => {
+                            return Err(JsNativeError::typ()
+                                .with_message(
+                                    "async fetch handler returned a Promise that did not settle \
+                                     synchronously; await-based async handlers are not yet supported",
+                                )
+                                .into());
+                        }
+                    }
+                } else {
+                    resp_obj.clone()
+                };
+
                 let status = resp_obj
                     .get(js_string!("status"), ctx)?
                     .to_number(ctx)
@@ -342,12 +401,15 @@ impl JsEngineBackend for BoaEngine {
             .map_err(|e| JsError::msg(format!("script evaluation failed: {e}")))?;
 
         let h = self.alloc_handle()?;
+        let gen = MODULE_GENERATION.load(Ordering::Relaxed);
         self.modules.insert(
             h,
             ModuleState {
                 source: source.to_string(),
+                generation: gen,
             },
         );
+        ACTIVE_HANDLES.insert((self.engine_id, h), gen);
         Ok(ModuleHandle(h))
     }
 
@@ -382,14 +444,27 @@ impl JsEngineBackend for BoaEngine {
             let mut cache = cache.borrow_mut();
             let key = (engine_id, handle_id);
 
+            // Evict stale entries: if the handle is no longer active (module was
+            // dropped) or the generation has advanced since this context was built,
+            // remove the entry so it gets re-created or properly errors.
+            if let Some(wctx) = cache.get(&key) {
+                let still_active = ACTIVE_HANDLES
+                    .get(&key)
+                    .map(|g| *g == wctx.generation)
+                    .unwrap_or(false);
+                if !still_active {
+                    cache.remove(&key);
+                }
+            }
+
             // Lazy-initialise the per-thread worker context for this handle.
             // The Context is built once per thread and reused across all subsequent
             // requests, avoiding a full parse+eval cycle on every call.
             if !cache.contains_key(&key) {
-                let source = {
+                let (source, gen) = {
                     let module = self.modules.get(&handle_id)
                         .ok_or_else(|| JsError::msg(format!("unknown handle {}", handle_id)))?;
-                    module.source.clone()
+                    (module.source.clone(), module.generation)
                 };
 
                 let response_capture: Arc<Mutex<Option<CapturedResponse>>> =
@@ -415,7 +490,7 @@ impl JsEngineBackend for BoaEngine {
                     ));
                 }
 
-                cache.insert(key, WorkerContext { context, response_capture });
+                cache.insert(key, WorkerContext { context, response_capture, generation: gen });
             }
 
             let wctx = cache.get_mut(&key).unwrap();
@@ -474,9 +549,13 @@ impl JsEngineBackend for BoaEngine {
 
     fn drop_module(&self, handle: ModuleHandle) {
         self.modules.remove(&handle.0);
-        // Also remove the cached worker context for the current thread so the
-        // memory is reclaimed promptly on the thread that owns it.
         let key = (self.engine_id, handle.0);
+        // Remove from the global active-handles registry and bump the generation
+        // counter.  Worker threads will detect the stale entry on their next access
+        // and evict it, preventing unbounded context leaks across threads.
+        ACTIVE_HANDLES.remove(&key);
+        MODULE_GENERATION.fetch_add(1, Ordering::Release);
+        // Eagerly reclaim the cached context on the current thread.
         WORKER_CONTEXTS.with(|cache| {
             cache.borrow_mut().remove(&key);
         });

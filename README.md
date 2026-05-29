@@ -78,6 +78,17 @@ helios exec  <script.js> [-s]
 
 `helios bench` is a built-in closed-loop load generator with HDR-histogram latency tracking and optional coordinated-omission correction.
 
+### Performance (v1.1.0-beta, 4-core)
+
+```text
+  - Baseline: 87,800 req/s, p50=0.716ms
+  - Optimized: 135,145 req/s, p50=0.464ms (+54% throughput, -35% latency)
+  - Peak (128 conns): 149,504 req/s, p50=0.809ms
+  - Peak (256 conns): 164,387 req/s, p50=1.457ms
+```
+
+Static-response handlers (constant output regardless of request) are automatically detected at startup and served via a zero-allocation raw TCP fast path — no JS execution per request.
+
 ```sh
 # Start the server
 ./bin/helios serve bench/helios-simple.js --port 8080

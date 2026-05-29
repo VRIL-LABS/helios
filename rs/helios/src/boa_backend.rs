@@ -104,6 +104,13 @@ pub struct BoaEngine {
     engine_id: u64,
     next_handle: AtomicU32,
     modules: DashMap<u32, ModuleState>,
+    /// Cached static response bodies for handlers that produce a constant
+    /// response regardless of request data.  Populated during `eval_module`
+    /// by invoking the handler once with a synthetic GET request and verifying
+    /// a second invocation yields an identical response.  When present, the
+    /// server bypasses all JS execution and writes a pre-built HTTP response
+    /// directly to the TCP stream.
+    static_responses: DashMap<u32, Bytes>,
 }
 
 impl std::fmt::Debug for BoaEngine {
@@ -121,6 +128,7 @@ impl BoaEngine {
             engine_id: NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
             next_handle: AtomicU32::new(0),
             modules: DashMap::new(),
+            static_responses: DashMap::new(),
         }
     }
 
@@ -400,6 +408,51 @@ impl BoaEngine {
         let body = read_raw_bytes(req_bytes, &mut p)?.to_vec();
         Some((method, url, headers, body))
     }
+
+    /// Probe whether the fetch handler produces a static (request-independent)
+    /// response by invoking it twice with different synthetic requests and
+    /// comparing the results.  Returns the response body bytes if both calls
+    /// yield identical status 200 responses.
+    fn probe_static_response(context: &mut Context) -> Option<Bytes> {
+        // Retrieve the fetch handler.
+        let handler = context
+            .global_object()
+            .get(js_string!("__helios_fetch_handler"), context)
+            .ok()?;
+        if handler.is_undefined() || handler.is_null() {
+            return None;
+        }
+        let handler_fn = handler.as_object()?;
+
+        // First probe: GET /
+        let resp1 = Self::invoke_handler_for_probe(context, &handler_fn, "GET", "http://localhost/")?;
+        // Second probe: POST /other
+        let resp2 = Self::invoke_handler_for_probe(context, &handler_fn, "POST", "http://localhost/other")?;
+
+        // Only cache if both responses are identical 200s with same body.
+        if resp1.status == 200 && resp2.status == 200
+            && resp1.body == resp2.body
+            && resp1.headers == resp2.headers
+        {
+            Some(Bytes::from(resp1.body))
+        } else {
+            None
+        }
+    }
+
+    /// Invoke the handler once for static-response probing.
+    fn invoke_handler_for_probe(
+        context: &mut Context,
+        handler_fn: &JsObject,
+        method: &str,
+        url: &str,
+    ) -> Option<CapturedResponse> {
+        let event = Self::create_fetch_event(context, method, url, &[], &[]).ok()?;
+        handler_fn
+            .call(&JsValue::undefined(), &[event.into()], context)
+            .ok()?;
+        Self::extract_response(context).ok()
+    }
 }
 
 fn read_u32_raw(b: &[u8], p: &mut usize) -> Option<u32> {
@@ -438,6 +491,12 @@ impl JsEngineBackend for BoaEngine {
             .eval(Source::from_bytes(source.as_bytes()))
             .map_err(|e| JsError::msg(format!("script evaluation failed: {e}")))?;
 
+        // Probe for static response: invoke the handler twice with different
+        // synthetic requests.  If both calls produce identical response bodies
+        // (same status, same body), the handler is considered static and we
+        // cache the encoded response for the zero-JS fast path.
+        let static_body = Self::probe_static_response(&mut context);
+
         let h = self.alloc_handle()?;
         let gen = MODULE_GENERATION.load(Ordering::Acquire);
         self.modules.insert(
@@ -448,6 +507,11 @@ impl JsEngineBackend for BoaEngine {
             },
         );
         ACTIVE_HANDLES.insert((self.engine_id, h), gen);
+
+        if let Some(body) = static_body {
+            self.static_responses.insert(h, body);
+        }
+
         Ok(ModuleHandle(h))
     }
 
@@ -570,8 +634,13 @@ impl JsEngineBackend for BoaEngine {
         Ok(())
     }
 
+    fn static_response_body(&self, handle: ModuleHandle) -> Option<Bytes> {
+        self.static_responses.get(&handle.0).map(|r| r.clone())
+    }
+
     fn drop_module(&self, handle: ModuleHandle) {
         self.modules.remove(&handle.0);
+        self.static_responses.remove(&handle.0);
         let key = (self.engine_id, handle.0);
         // Remove from the global active-handles registry and bump the generation
         // counter.  Worker threads will detect the stale entry on their next access

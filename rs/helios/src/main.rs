@@ -16,11 +16,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use helios::bench;
+use helios::boa_backend::BoaEngine;
 use helios::dispatcher::{DispatchPolicy, HeliosDispatcher};
 use helios::engine::JsEngineBackend;
 use helios::http3::{run_server, InlineEngine, ServerConfig, TlsConfig};
 use helios::wizer_build;
-use helios::xdr::{StubEngine, UserCode, XdrCache};
+use helios::xdr::{UserCode, XdrCache};
 
 #[derive(Parser, Debug)]
 #[command(name = "helios", version, about = "HELIOS — JIT at the edge. Finally.")]
@@ -206,7 +207,7 @@ fn main() -> Result<()> {
 async fn cmd_serve(s: Serve) -> Result<()> {
     let user_code = UserCode::from_path(&s.js_path, s.script)?;
     let cache = Arc::new(XdrCache::new());
-    let bootstrap_engine = Arc::new(StubEngine::new());
+    let bootstrap_engine = Arc::new(BoaEngine::new());
     cache.compile_user_code(bootstrap_engine.as_ref(), &user_code)?;
 
     let entry = cache
@@ -217,7 +218,7 @@ async fn cmd_serve(s: Serve) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("inline engine warmup failed: {e}"))?;
 
     let dispatcher =
-        HeliosDispatcher::spawn(s.workers, s.policy.into(), cache, || Ok(StubEngine::new()))?;
+        HeliosDispatcher::spawn(s.workers, s.policy.into(), cache, || Ok(BoaEngine::new()))?;
     tracing::info!(workers = dispatcher.worker_count(),
         policy = ?DispatchPolicy::from(s.policy), "dispatcher up");
 

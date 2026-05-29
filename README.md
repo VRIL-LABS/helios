@@ -7,7 +7,7 @@
 
 Helios is a Rust-based HTTP server and toolchain for running Workers-style JavaScript handlers at the edge. It provides multi-protocol HTTP serving (HTTP/1.1, HTTP/2, and HTTP/3), a built-in load-testing tool, and a Wizer-based WASM snapshot pipeline.
 
-> **Status: v1.1.0-beta.** The current release ships the full server, dispatch, and benchmarking infrastructure. Full JavaScript handler execution via SpiderMonkey JIT is in active development and is not yet enabled in this build.
+> **Status: v1.1.0-beta.** The current release ships the full server, dispatch, and benchmarking infrastructure with JavaScript execution powered by the Boa ECMAScript engine. Full SpiderMonkey JIT integration is in active development for maximum performance.
 
 ## Quick start
 
@@ -44,7 +44,7 @@ addEventListener('fetch', (event) => {
 });
 ```
 
-> **Note:** In this build, the SpiderMonkey JS engine is not yet enabled. The server uses a stub engine that returns `{"ok":true}` for every request regardless of the handler source. The handler above will be executed once full JS execution is enabled.
+> **Note:** Full SpiderMonkey JIT execution is in development. The current build uses the Boa ECMAScript engine, which executes your handler JavaScript and returns the actual response body. SpiderMonkey JIT will provide higher throughput once integrated.
 
 See [`bench/helios-simple.js`](bench/helios-simple.js) for a minimal example and [`bench/complex.js`](bench/complex.js) for a more involved one.
 
@@ -72,7 +72,7 @@ helios exec  <script.js> [-s]
 - `-s` / `--script` runs the JS file in script mode (no module resolution). Applies to both `helios serve` and `helios exec`.
 - HTTP/3 requires a TLS certificate and key (`--cert` / `--key`) because QUIC mandates TLS 1.3. The `--alt-svc` flag sets the `Alt-Svc` response header to advertise the H3 endpoint to clients.
 - `helios build` invokes [Wizer](https://github.com/bytecodealliance/wizer) to produce a pre-initialized WASM snapshot. Requires `wizer` on `PATH` and a compatible `helios-worker.wasm` component. `wasm-opt` is also required unless `--no-opt` is passed.
-- `helios exec` requires the SpiderMonkey backend (not yet enabled in this build).
+- `helios exec` runs a script once using the Boa JS engine and exits.
 
 ## Benchmarking
 

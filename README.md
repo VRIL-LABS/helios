@@ -82,7 +82,7 @@ helios exec  <script.js> [-s]
 
 ```text
   - Baseline: 87,800 req/s, p50=0.716ms
-  - Optimized: 135,145 req/s, p50=0.464ms (+54% throughput, -35% latency)
+  - Optimized: 135,812 req/s, p50=0.462ms (+54% throughput, -35% latency)
   - Peak (128 conns): 149,504 req/s, p50=0.809ms
   - Peak (256 conns): 164,387 req/s, p50=1.457ms
 ```

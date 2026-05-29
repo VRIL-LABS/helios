@@ -209,7 +209,7 @@ async fn serve_static_h1_connection(
         // Process all complete requests in the buffer before reading again.
         // Batch responses: count how many complete requests are available and
         // write all responses in a single syscall when possible.
-        let mut responses_pending = 0u32;
+        let mut requests_ready = 0u32;
         while let Some(header_end) = find_header_end_from(&buf[..len], header_scan) {
             let headers = &buf[..header_end];
             let body_len = h1_request_body_len(headers);
@@ -218,7 +218,7 @@ async fn serve_static_h1_connection(
                 header_scan = header_end;
                 break;
             }
-            responses_pending += 1;
+            requests_ready += 1;
 
             if request_len == len {
                 len = 0;
@@ -231,16 +231,16 @@ async fn serve_static_h1_connection(
         }
 
         // Write all pending responses in one batch.
-        if responses_pending > 0 {
-            if responses_pending == 1 {
+        if requests_ready > 0 {
+            if requests_ready == 1 {
                 write_all_fast(stream, response)
                     .await
                     .context("write h1 response")?;
             } else {
                 // Batch write: repeat the response N times into a single buffer.
-                let batch_len = response.len() * responses_pending as usize;
+                let batch_len = response.len() * requests_ready as usize;
                 let mut batch = Vec::with_capacity(batch_len);
-                for _ in 0..responses_pending {
+                for _ in 0..requests_ready {
                     batch.extend_from_slice(response);
                 }
                 write_all_fast(stream, &batch)

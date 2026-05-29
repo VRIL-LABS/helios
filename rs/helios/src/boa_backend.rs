@@ -429,10 +429,14 @@ impl BoaEngine {
         // Second probe: POST /other
         let resp2 = Self::invoke_handler_for_probe(context, &handler_fn, "POST", "http://localhost/other")?;
 
-        // Only cache if both responses are identical 200s with same body.
+        // Only cache if both responses are identical 200s with same body and
+        // the handler did not set any custom headers.  Custom headers cannot be
+        // represented by the precomputed raw-TCP fast path, so we skip caching
+        // when they are present to avoid silently dropping them.
         if resp1.status == 200 && resp2.status == 200
             && resp1.body == resp2.body
             && resp1.headers == resp2.headers
+            && resp1.headers.is_empty()
         {
             Some(Bytes::from(resp1.body))
         } else {

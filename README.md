@@ -46,6 +46,8 @@ addEventListener('fetch', (event) => {
 
 > **Note:** Full SpiderMonkey JIT execution is in development. The current build uses the Boa ECMAScript engine, which executes your handler JavaScript and returns the actual response body. SpiderMonkey JIT will provide higher throughput once integrated.
 
+> **Static-response optimization:** At startup, Helios probes your fetch handler by invoking it twice with synthetic requests (`GET http://localhost/` and `POST http://localhost/other`). If both calls produce identical 200 responses with no custom headers, the response is cached and served via a zero-JS raw-TCP fast path for maximum throughput. Handlers with side effects (counters, logging, external calls) will observe these probe invocations at boot time.
+
 See [`bench/helios-simple.js`](bench/helios-simple.js) for a minimal example and [`bench/complex.js`](bench/complex.js) for a more involved one.
 
 ## CLI reference

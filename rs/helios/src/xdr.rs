@@ -352,10 +352,10 @@ mod spidermonkey_backend {
     use bytes::{BufMut, BytesMut};
     use mozjs::conversions::{ConversionResult, FromJSValConvertible, ToJSValConvertible};
     use mozjs::jsapi::{HandleValueArray, JSObject, OnNewGlobalHookOption};
-    use mozjs::jsval::{ObjectValue, UndefinedValue};
+    use mozjs::jsval::UndefinedValue;
     use mozjs::realm::AutoRealm;
     use mozjs::rooted;
-    use mozjs::rust::wrappers2::{JS_CallFunctionValue, JS_GetProperty, JS_NewGlobalObject};
+    use mozjs::rust::wrappers2::{JS_CallFunctionName, JS_NewGlobalObject};
     use mozjs::rust::{
         evaluate_script, CompileOptionsWrapper, IntoHandle, JSEngine, JSEngineHandle, RealmOptions,
         RootedObjectVectorWrapper, Runtime, SIMPLE_GLOBAL_CLASS,
@@ -386,7 +386,6 @@ mod spidermonkey_backend {
         _roots: RootedObjectVectorWrapper,
         runtime: Runtime,
         global: *mut JSObject,
-        call_fetch: *mut JSObject,
         generation: u32,
     }
 
@@ -448,18 +447,11 @@ mod spidermonkey_backend {
                         }
                         eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
                         eval(cx, global.handle(), &state.source, "helios-worker.js")?;
-                        let call_fetch = get_call_fetch_func(cx, global.handle())?;
-                        if !roots.append(call_fetch) {
-                            return Err(JsError::msg(
-                                "failed to root SpiderMonkey fetch dispatcher",
-                            ));
-                        }
-                        warm_up_fetch_handler(cx, global.handle(), call_fetch)?;
+                        warm_up_fetch_handler(cx, global.handle())?;
                         SmWorkerContext {
                             _roots: roots,
                             runtime,
                             global: global.get(),
-                            call_fetch,
                             generation: state.generation,
                         }
                     };
@@ -512,13 +504,7 @@ mod spidermonkey_backend {
                 let cx = ctx.runtime.cx();
                 unsafe {
                     rooted!(&in(cx) let global = ctx.global);
-                    call_fetch_json_to_string(
-                        cx,
-                        global.handle(),
-                        ctx.call_fetch,
-                        &req_json,
-                        "helios-fetch.js",
-                    )
+                    call_fetch_json_to_string(cx, global.handle(), &req_json, "helios-fetch.js")
                 }
             })?;
 
@@ -636,10 +622,8 @@ mod spidermonkey_backend {
             body: Vec::new(),
         })
         .map_err(|e| JsError::msg(e.to_string()))?;
-        let call_fetch = unsafe { get_call_fetch_func(cx, global) }?;
-        let resp_json = unsafe {
-            call_fetch_json_to_string(cx, global, call_fetch, &req, "helios-static-probe.js")
-        }?;
+        let resp_json =
+            unsafe { call_fetch_json_to_string(cx, global, &req, "helios-static-probe.js") }?;
         serde_json::from_str(&resp_json)
             .map_err(|e| JsError::msg(format!("invalid probe response: {e}")))
     }
@@ -673,43 +657,14 @@ mod spidermonkey_backend {
         })
     }
 
-    unsafe fn get_call_fetch_func(
-        cx: &mut mozjs::context::JSContext,
-        global: mozjs::rust::HandleObject,
-    ) -> Result<*mut JSObject, JsError> {
-        rooted!(&in(cx) let mut call_fetch = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                global,
-                CALL_FETCH_NAME.as_ptr() as *const std::os::raw::c_char,
-                call_fetch.handle_mut(),
-            )
-        } {
-            return Err(JsError::msg(
-                "failed to resolve SpiderMonkey fetch dispatcher",
-            ));
-        }
-        let call_fetch = call_fetch.get();
-        if !call_fetch.is_object() {
-            return Err(JsError::msg(
-                "SpiderMonkey fetch dispatcher is not a function",
-            ));
-        }
-        Ok(call_fetch.to_object())
-    }
-
     unsafe fn call_fetch_json_to_string(
         cx: &mut mozjs::context::JSContext,
         global: mozjs::rust::HandleObject,
-        call_fetch: *mut JSObject,
         req_json: &str,
         filename_for_error: &str,
     ) -> Result<String, JsError> {
         let mut realm = AutoRealm::new_from_handle(cx, global);
         let cx = &mut *realm;
-        rooted!(&in(cx) let call_fetch = call_fetch);
-        rooted!(&in(cx) let call_fetch_val = ObjectValue(call_fetch.get()));
         rooted!(&in(cx) let mut req_arg = UndefinedValue());
         unsafe {
             req_json.to_jsval(cx.raw_cx(), req_arg.handle_mut());
@@ -717,10 +672,10 @@ mod spidermonkey_backend {
         let args = HandleValueArray::from(req_arg.handle().into_handle());
         rooted!(&in(cx) let mut rval = UndefinedValue());
         if !unsafe {
-            JS_CallFunctionValue(
+            JS_CallFunctionName(
                 cx,
                 global,
-                call_fetch_val.handle(),
+                CALL_FETCH_NAME.as_ptr() as *const std::os::raw::c_char,
                 &args,
                 rval.handle_mut(),
             )
@@ -741,7 +696,6 @@ mod spidermonkey_backend {
     unsafe fn warm_up_fetch_handler(
         cx: &mut mozjs::context::JSContext,
         global: mozjs::rust::HandleObject,
-        call_fetch: *mut JSObject,
     ) -> Result<(), JsError> {
         let req = serde_json::to_string(&RequestForJs {
             method: "GET".to_owned(),
@@ -752,7 +706,7 @@ mod spidermonkey_backend {
         .map_err(|e| JsError::msg(e.to_string()))?;
         for _ in 0..JIT_WARMUP_ITERS {
             unsafe {
-                call_fetch_json_to_string(cx, global, call_fetch, &req, "helios-jit-warmup.js")?;
+                call_fetch_json_to_string(cx, global, &req, "helios-jit-warmup.js")?;
             }
         }
         Ok(())

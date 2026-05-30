@@ -371,6 +371,7 @@ mod spidermonkey_backend {
     pub struct SpiderMonkeyEngine {
         next_handle: AtomicU32,
         modules: DashMap<u32, ModuleState>,
+        static_responses: DashMap<u32, Bytes>,
     }
 
     #[derive(Clone)]
@@ -407,6 +408,7 @@ mod spidermonkey_backend {
             Ok(Self {
                 next_handle: AtomicU32::new(0),
                 modules: DashMap::new(),
+                static_responses: DashMap::new(),
             })
         }
 
@@ -461,6 +463,7 @@ mod spidermonkey_backend {
     impl JsEngineBackend for SpiderMonkeyEngine {
         fn eval_module(&self, source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
             validate_module(source)?;
+            let static_response = probe_static_response(source)?;
             let handle = self.alloc_handle()?;
             self.modules.insert(
                 handle,
@@ -469,6 +472,9 @@ mod spidermonkey_backend {
                     generation: 0,
                 },
             );
+            if let Some(body) = static_response {
+                self.static_responses.insert(handle, body);
+            }
             Ok(ModuleHandle(handle))
         }
 
@@ -512,8 +518,12 @@ mod spidermonkey_backend {
         fn drain_microtasks(&self, _h: ModuleHandle) -> Result<(), JsError> {
             Ok(())
         }
+        fn static_response_body(&self, h: ModuleHandle) -> Option<Bytes> {
+            self.static_responses.get(&h.0).map(|r| r.clone())
+        }
         fn drop_module(&self, h: ModuleHandle) {
             self.modules.remove(&h.0);
+            self.static_responses.remove(&h.0);
             WORKER_CONTEXTS.with(|contexts| {
                 contexts.borrow_mut().remove(&h.0);
             });
@@ -575,6 +585,56 @@ mod spidermonkey_backend {
             )?;
         }
         Ok(())
+    }
+
+    fn probe_static_response(source: &str) -> Result<Option<Bytes>, JsError> {
+        let mut runtime = Runtime::new(engine_handle()?);
+        let cx = runtime.cx();
+        let options = RealmOptions::default();
+        unsafe {
+            rooted!(&in(cx) let global = JS_NewGlobalObject(
+                cx,
+                &SIMPLE_GLOBAL_CLASS,
+                ptr::null_mut(),
+                OnNewGlobalHookOption::FireOnNewGlobalHook,
+                &*options,
+            ));
+            eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
+            eval(cx, global.handle(), source, "helios-worker.js")?;
+            let first = invoke_for_probe(cx, global.handle(), "GET", "http://localhost/")?;
+            let second = invoke_for_probe(cx, global.handle(), "POST", "http://localhost/other")?;
+            if first == second && first.status == 200 && first.headers.is_empty() {
+                Ok(Some(Bytes::from(first.body)))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    unsafe fn invoke_for_probe(
+        cx: &mut mozjs::context::JSContext,
+        global: mozjs::rust::HandleObject,
+        method: &str,
+        url: &str,
+    ) -> Result<ResponseFromJs, JsError> {
+        let req = serde_json::to_string(&RequestForJs {
+            method: method.to_owned(),
+            url: url.to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .map_err(|e| JsError::msg(e.to_string()))?;
+        let literal = serde_json::to_string(&req).map_err(|e| JsError::msg(e.to_string()))?;
+        let resp_json = unsafe {
+            eval_to_string(
+                cx,
+                global,
+                &format!("__helios_call_fetch({literal})"),
+                "helios-static-probe.js",
+            )
+        }?;
+        serde_json::from_str(&resp_json)
+            .map_err(|e| JsError::msg(format!("invalid probe response: {e}")))
     }
 
     fn decode_source_xdr(xdr: &[u8]) -> Result<&str, JsError> {
@@ -681,7 +741,7 @@ mod spidermonkey_backend {
         }
     }
 
-    #[derive(Deserialize)]
+    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
     struct ResponseFromJs {
         status: u16,
         headers: Vec<(String, String)>,

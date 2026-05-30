@@ -162,19 +162,18 @@
       }
 
       @keyframes ufoFly {
-        0%, 4.9%  { transform: translateX(1380px); opacity: 0; }
-        5%        { transform: translateX(1280px); opacity: 1; }
-        5.8%      { transform: translateX(1180px); opacity: .80; }
-        13%       { transform: translateX(150px);  opacity: .80; }
-        14.5%     { transform: translateX(144px);  opacity: 0; }
+        0%, 2.9% { transform: translateX(1380px); opacity: 0; }
+        3%        { transform: translateX(1260px); opacity: 1; }
+        7%        { transform: translateX(150px);  opacity: .88; }
+        7.8%      { transform: translateX(144px);  opacity: 0; }
         100%      { transform: translateX(144px);  opacity: 0; }
       }
 
       @keyframes portalOpen {
-        0%, 11%   { transform: scale(0);   opacity: 0; }
-        13%       { transform: scale(1);   opacity: .76; }
-        14.2%     { transform: scale(1.6); opacity: .38; }
-        15.5%     { transform: scale(2.5); opacity: 0; }
+        0%, 7.5%  { transform: scale(0);   opacity: 0; }
+        8.2%      { transform: scale(1);   opacity: .76; }
+        9%        { transform: scale(1.6); opacity: .38; }
+        10%       { transform: scale(2.5); opacity: 0; }
         100%      { transform: scale(2.5); opacity: 0; }
       }
     </style>
@@ -218,9 +217,9 @@
     <!-- Saucer + contrails (translate across sky right→left) -->
     <g class="ufo-anim" style="animation:ufoFly 65s ease-in 0s infinite;">
       <!-- Contrails trailing to the right as saucer moves left -->
-      <rect x="18" y="-1"   width="210" height="2"   rx="1"   fill="url(#starTrail)" opacity=".52"/>
-      <rect x="18" y="3.5"  width="150" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".28"/>
-      <rect x="18" y="-4.5" width="115" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".22"/>
+      <rect x="18" y="-1"   width="280" height="2"   rx="1"   fill="url(#starTrail)" opacity=".58"/>
+      <rect x="18" y="3.5"  width="200" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".32"/>
+      <rect x="18" y="-4.5" width="155" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".26"/>
       <!-- Saucer body -->
       <ellipse cx="0" cy="0"  rx="22" ry="7"  fill="#fffde0" opacity=".84"/>
       <!-- Dome -->
@@ -243,12 +242,6 @@
     </g>
   </g>
 
-  <g class="orb">
-    <circle cx="700" cy="226" r="250" fill="url(#sunGlow)" filter="url(#softBlur)"/>
-    <circle cx="700" cy="226" r="122" fill="#fff2a3" opacity=".94"/>
-    <circle cx="700" cy="226" r="84" fill="#fff9d7" opacity=".86"/>
-  </g>
-
   <g class="ray" opacity=".5">
     <path d="M700 22 724 202 700 226 676 202Z" fill="#fff3a8"/>
     <path d="M700 418 724 250 700 226 676 250Z" fill="#ffe08c"/>
@@ -265,6 +258,12 @@
     <path d="M700 468 740 254 700 226 660 254Z" fill="#ffbb56"/>
     <path d="M458 226 672 186 700 226 672 266Z" fill="#fff8c6"/>
     <path d="M942 226 728 186 700 226 728 266Z" fill="#ffbb56"/>
+  </g>
+
+  <g class="orb">
+    <circle cx="700" cy="226" r="250" fill="url(#sunGlow)" filter="url(#softBlur)"/>
+    <circle cx="700" cy="226" r="122" fill="#fff2a3" opacity=".94"/>
+    <circle cx="700" cy="226" r="84" fill="#fff9d7" opacity=".86"/>
   </g>
 
   <g clip-path="url(#windowClip)" opacity=".88">
@@ -364,11 +363,13 @@
         font-size="13.5" font-weight="800" letter-spacing=".5"
         filter="url(#tagShadow)">Latency!</text>
 
-  <!-- "by VRIL LABS" attribution — above window layer -->
-  <text x="1186" y="351" text-anchor="end"
-        fill="#ffd88b"
-        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="9.5" font-weight="600" letter-spacing="2.8"
-        opacity=".62" filter="url(#tagShadow)">by VRIL LABS</text>
+  <!-- "by VRIL LABS" attribution — isolated group ensures it composites above glass layer -->
+  <g style="isolation:isolate">
+    <text x="1186" y="351" text-anchor="end"
+          fill="#ffd88b"
+          font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+          font-size="9.5" font-weight="600" letter-spacing="2.8"
+          opacity=".88" filter="url(#tagShadow)">by VRIL LABS</text>
+  </g>
 
 </svg>

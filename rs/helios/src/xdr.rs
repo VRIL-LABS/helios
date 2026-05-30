@@ -555,10 +555,12 @@ mod spidermonkey_backend {
     }
 
     #[cfg(test)]
-    pub(super) unsafe fn shutdown_engine_for_tests() {
-        if let Some(ptr) = ENGINE.get().copied().filter(|ptr| *ptr != 0) {
-            drop(unsafe { Box::from_raw(ptr as *mut JSEngine) });
-        }
+    pub(super) fn shutdown_engine_for_tests() {
+        // Intentional no-op: the process-wide JSEngine stored in a OnceLock
+        // cannot be safely dropped and reused.  Dropping it would leave ENGINE
+        // pointing at freed memory, causing use-after-free on subsequent calls.
+        // SpiderMonkey is designed to initialize once per process so we simply
+        // let it live until process exit.
     }
 
     fn validate_module(source: &str) -> Result<(), JsError> {
@@ -834,13 +836,22 @@ mod spidermonkey_backend {
         function __helios_call_fetch(reqJson) {
             __helios_assert_fetch_handler();
             var req = JSON.parse(reqJson);
+            var headersObj = {};
+            var rawHeaders = req.headers || [];
+            for (var i = 0; i < rawHeaders.length; i++) {
+                headersObj[String(rawHeaders[i][0])] = String(rawHeaders[i][1]);
+            }
+            var bodyBytes = null;
+            if (req.body && req.body.length > 0) {
+                bodyBytes = new Uint8Array(req.body);
+            }
             var captured = undefined;
             var event = {
                 request: {
                     method: String(req.method || 'GET'),
                     url: String(req.url || '/'),
-                    headers: req.headers || [],
-                    body: req.body || []
+                    headers: headersObj,
+                    body: bodyBytes
                 },
                 respondWith: function(response) {
                     captured = response;
@@ -852,6 +863,9 @@ mod spidermonkey_backend {
             }
             if (!captured) {
                 throw new Error('fetch handler did not call event.respondWith()');
+            }
+            if (typeof captured !== 'object' || captured === null) {
+                throw new Error('respondWith expects a Response object');
             }
             return JSON.stringify({
                 status: Number(captured.status || 200),
@@ -928,9 +942,7 @@ mod tests {
         );
         assert_eq!(body, b"sm");
         eng.drop_module(handle);
-        unsafe {
-            spidermonkey_backend::shutdown_engine_for_tests();
-        }
+        spidermonkey_backend::shutdown_engine_for_tests();
     }
 
     #[cfg(feature = "spidermonkey")]

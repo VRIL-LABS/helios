@@ -340,85 +340,434 @@ impl XdrCompiler for StubEngine {
 
 #[cfg(feature = "spidermonkey")]
 mod spidermonkey_backend {
-    //! Real SpiderMonkey XDR pipeline. Bridges to `mozjs::jsapi::JS_*`.
-    //!
-    //! Wired up via the `runtime` crate (spiderfire) so we re-use its
-    //! `Runtime` + `RuntimeBuilder` and don't duplicate root management.
-    //!
-    //! Only the FFI shape is sketched here — the full integration depends
-    //! on the spiderfire fork being patched to expose `EncodeScript` /
-    //! `DecodeScript`. See `/.github/copilot-instructions/instructions.md`
-    //! Phase 2 for the contract.
-
     use super::*;
-    use std::marker::PhantomData;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::ptr;
+    use std::sync::OnceLock;
 
-    /// Production engine backed by the spiderfire `Runtime`. Each worker
-    /// thread owns one of these; the underlying SpiderMonkey JS context
-    /// is thread-pinned (per WinterJS convention).
-    ///
-    /// **`Send` + `Sync` status:**  This struct is currently `Send` and
-    /// `Sync` because it is a no-op stub with no interior mutable state.
-    /// The `PhantomData<*const ()>` field is kept intentionally so that
-    /// auto-`Sync` is suppressed the moment any real SpiderMonkey pointer
-    /// or `RefCell` is added.  At that point the explicit
-    /// `unsafe impl Sync` below **must be removed** and the dispatcher
-    /// restructured to use per-thread engines.
+    use bytes::{BufMut, BytesMut};
+    use mozjs::conversions::{ConversionResult, FromJSValConvertible};
+    use mozjs::jsapi::{JSObject, OnNewGlobalHookOption};
+    use mozjs::jsval::UndefinedValue;
+    use mozjs::rooted;
+    use mozjs::rust::wrappers2::JS_NewGlobalObject;
+    use mozjs::rust::{
+        evaluate_script, CompileOptionsWrapper, JSEngine, JSEngineHandle, RealmOptions,
+        RootedObjectVectorWrapper, Runtime, SIMPLE_GLOBAL_CLASS,
+    };
+    use serde::{Deserialize, Serialize};
+
+    const SM_MAGIC: &[u8] = b"HSMJ";
+    const JIT_WARMUP_ITERS: usize = 128;
+
+    /// Production engine backed by native SpiderMonkey through the `mozjs`
+    /// crate.  SpiderMonkey's own `jit` crate feature is enabled by default,
+    /// so hot fetch handlers can tier up in the native runtime instead of
+    /// executing inside a Wasm sandbox without executable pages.
     pub struct SpiderMonkeyEngine {
-        // Holds spiderfire `runtime::Runtime` + a `module-handle -> JS root`
-        // table guarded by an internal `RefCell` — single-threaded inside.
-        _not_sync: PhantomData<*const ()>,
+        next_handle: AtomicU32,
+        modules: DashMap<u32, ModuleState>,
     }
 
-    // SAFETY: Both Send and Sync are safe for the current no-op stub.
-    // PhantomData<*const ()> suppresses auto-Sync so these impls are
-    // explicit and must be reviewed when real SpiderMonkey state is added.
-    // Remove `unsafe impl Sync` once the struct holds thread-pinned state.
-    unsafe impl Send for SpiderMonkeyEngine {}
-    unsafe impl Sync for SpiderMonkeyEngine {}
+    #[derive(Clone)]
+    struct ModuleState {
+        source: String,
+        generation: u32,
+    }
+
+    struct SmWorkerContext {
+        roots: RootedObjectVectorWrapper,
+        runtime: Runtime,
+        global: *mut JSObject,
+        generation: u32,
+    }
+
+    thread_local! {
+        static WORKER_CONTEXTS: RefCell<HashMap<u32, SmWorkerContext>> =
+            RefCell::new(HashMap::new());
+    }
 
     impl std::fmt::Debug for SpiderMonkeyEngine {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("SpiderMonkeyEngine")
+            f.debug_struct("SpiderMonkeyEngine")
+                .field("modules", &self.modules.len())
+                .finish()
         }
     }
 
     impl SpiderMonkeyEngine {
         pub fn new() -> Result<Self, JsError> {
-            // 1. Initialize the global `JSEngineHandle` (see
-            //    winterjs-main/src/sm_utils.rs::ENGINE).
-            // 2. Build a `Runtime` with `RealmOptions` that enable
-            //    Baseline + Ion JIT (this is the breakthrough — JIT is
-            //    available because we're running native, not in a WASM
-            //    sandbox without PROT_EXEC pages).
-            // 3. Install standard WinterCG modules + the helios builtins
-            //    (webtransport, etc).
-            Ok(Self { _not_sync: PhantomData })
+            let _ = engine_handle()?;
+            Ok(Self {
+                next_handle: AtomicU32::new(0),
+                modules: DashMap::new(),
+            })
+        }
+
+        fn alloc_handle(&self) -> Result<u32, JsError> {
+            self.next_handle
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map(|prev| prev + 1)
+                .map_err(|_| JsError::msg("module handle counter overflowed u32"))
+        }
+
+        fn ensure_context(handle: u32, state: &ModuleState) -> Result<(), JsError> {
+            WORKER_CONTEXTS.with(|contexts| {
+                let mut contexts = contexts.borrow_mut();
+                let stale = contexts
+                    .get(&handle)
+                    .map(|ctx| ctx.generation != state.generation)
+                    .unwrap_or(true);
+
+                if stale {
+                    let mut runtime = Runtime::new(engine_handle()?);
+                    let cx = runtime.cx();
+                    let options = RealmOptions::default();
+                    let global = unsafe {
+                        rooted!(&in(cx) let global = JS_NewGlobalObject(
+                            cx,
+                            &SIMPLE_GLOBAL_CLASS,
+                            ptr::null_mut(),
+                            OnNewGlobalHookOption::FireOnNewGlobalHook,
+                            &*options,
+                        ));
+                        let roots = RootedObjectVectorWrapper::new(cx.raw_cx());
+                        if !roots.append(global.get()) {
+                            return Err(JsError::msg("failed to root SpiderMonkey global object"));
+                        }
+                        eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
+                        eval(cx, global.handle(), &state.source, "helios-worker.js")?;
+                        warm_up_fetch_handler(cx, global.handle())?;
+                        SmWorkerContext {
+                            roots,
+                            runtime,
+                            global: global.get(),
+                            generation: state.generation,
+                        }
+                    };
+                    contexts.insert(handle, global);
+                }
+                Ok(())
+            })
         }
     }
 
     impl JsEngineBackend for SpiderMonkeyEngine {
-        fn eval_module(&self, _source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
-            Err(JsError::msg("spidermonkey backend not yet wired"))
+        fn eval_module(&self, source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
+            validate_module(source)?;
+            let handle = self.alloc_handle()?;
+            self.modules.insert(
+                handle,
+                ModuleState {
+                    source: source.to_owned(),
+                    generation: 0,
+                },
+            );
+            Ok(ModuleHandle(handle))
         }
 
-        fn eval_xdr(&self, _xdr: Arc<[u8]>, _module_url: &str) -> Result<ModuleHandle, JsError> {
-            Err(JsError::msg("spidermonkey backend not yet wired"))
+        fn eval_xdr(&self, xdr: Arc<[u8]>, module_url: &str) -> Result<ModuleHandle, JsError> {
+            let source = decode_source_xdr(&xdr)?;
+            self.eval_module(source, module_url)
         }
 
-        fn call_fetch_handler(&self, _h: ModuleHandle, _b: Bytes) -> Result<Bytes, JsError> {
-            Err(JsError::msg("spidermonkey backend not yet wired"))
+        fn call_fetch_handler(&self, h: ModuleHandle, b: Bytes) -> Result<Bytes, JsError> {
+            let state = self
+                .modules
+                .get(&h.0)
+                .ok_or_else(|| JsError::msg(format!("unknown handle {}", h.0)))?
+                .clone();
+            Self::ensure_context(h.0, &state)?;
+
+            let req = RequestForJs::from_wire(&b);
+            let req_json = serde_json::to_string(&req)
+                .map_err(|e| JsError::msg(format!("failed to serialize request: {e}")))?;
+            let req_literal = serde_json::to_string(&req_json)
+                .map_err(|e| JsError::msg(format!("failed to quote request: {e}")))?;
+            let script = format!("__helios_call_fetch({req_literal})");
+
+            let resp_json = WORKER_CONTEXTS.with(|contexts| {
+                let mut contexts = contexts.borrow_mut();
+                let ctx = contexts
+                    .get_mut(&h.0)
+                    .ok_or_else(|| JsError::msg(format!("missing SpiderMonkey context {}", h.0)))?;
+                let cx = ctx.runtime.cx();
+                unsafe {
+                    rooted!(&in(cx) let global = ctx.global);
+                    eval_to_string(cx, global.handle(), &script, "helios-fetch.js")
+                }
+            })?;
+
+            let resp: ResponseFromJs = serde_json::from_str(&resp_json)
+                .map_err(|e| JsError::msg(format!("invalid fetch response: {e}")))?;
+            Ok(resp.to_wire())
         }
 
         fn drain_microtasks(&self, _h: ModuleHandle) -> Result<(), JsError> {
             Ok(())
         }
-        fn drop_module(&self, _h: ModuleHandle) {}
+        fn drop_module(&self, h: ModuleHandle) {
+            self.modules.remove(&h.0);
+            WORKER_CONTEXTS.with(|contexts| {
+                contexts.borrow_mut().remove(&h.0);
+            });
+        }
 
-        fn compile_to_xdr(&self, _source: &str, _module_url: &str) -> Result<Arc<[u8]>, JsError> {
-            Err(JsError::msg("spidermonkey backend not yet wired"))
+        fn compile_to_xdr(&self, source: &str, _module_url: &str) -> Result<Arc<[u8]>, JsError> {
+            validate_module(source)?;
+            let mut buf = Vec::with_capacity(8 + source.len());
+            buf.extend_from_slice(SM_MAGIC);
+            buf.extend_from_slice(&(source.len() as u32).to_le_bytes());
+            buf.extend_from_slice(source.as_bytes());
+            Ok(Arc::from(buf))
         }
     }
+
+    impl XdrCompiler for SpiderMonkeyEngine {
+        fn compile(&self, source: &str, module_url: &str) -> Result<Arc<[u8]>, JsError> {
+            <Self as JsEngineBackend>::compile_to_xdr(self, source, module_url)
+        }
+    }
+
+    fn engine_handle() -> Result<JSEngineHandle, JsError> {
+        static ENGINE: OnceLock<usize> = OnceLock::new();
+        let ptr = *ENGINE.get_or_init(|| match JSEngine::init() {
+            Ok(engine) => Box::into_raw(Box::new(engine)) as usize,
+            Err(_) => 0,
+        });
+        if ptr == 0 {
+            return Err(JsError::msg("failed to initialize SpiderMonkey engine"));
+        }
+        Ok(unsafe { (&*(ptr as *const JSEngine)).handle() })
+    }
+
+    fn validate_module(source: &str) -> Result<(), JsError> {
+        let mut runtime = Runtime::new(engine_handle()?);
+        let cx = runtime.cx();
+        let options = RealmOptions::default();
+        unsafe {
+            rooted!(&in(cx) let global = JS_NewGlobalObject(
+                cx,
+                &SIMPLE_GLOBAL_CLASS,
+                ptr::null_mut(),
+                OnNewGlobalHookOption::FireOnNewGlobalHook,
+                &*options,
+            ));
+            eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
+            eval(cx, global.handle(), source, "helios-worker.js")?;
+            eval(cx, global.handle(), "__helios_assert_fetch_handler()", "helios-validate.js")?;
+        }
+        Ok(())
+    }
+
+    fn decode_source_xdr(xdr: &[u8]) -> Result<&str, JsError> {
+        if xdr.len() < 8 || &xdr[..4] != SM_MAGIC {
+            return Err(JsError::msg("not a HELIOS SpiderMonkey XDR blob"));
+        }
+        let len = u32::from_le_bytes(xdr[4..8].try_into().unwrap()) as usize;
+        if 8 + len > xdr.len() {
+            return Err(JsError::msg("truncated SpiderMonkey XDR blob"));
+        }
+        std::str::from_utf8(&xdr[8..8 + len])
+            .map_err(|e| JsError::msg(format!("invalid UTF-8 in SpiderMonkey XDR: {e}")))
+    }
+
+    unsafe fn eval(
+        cx: &mut mozjs::context::JSContext,
+        global: mozjs::rust::HandleObject,
+        source: &str,
+        filename: &str,
+    ) -> Result<(), JsError> {
+        rooted!(&in(cx) let mut rval = UndefinedValue());
+        let filename =
+            std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
+        let options = CompileOptionsWrapper::new(cx, filename, 1);
+        evaluate_script(cx, global, source, rval.handle_mut(), options)
+            .map_err(|_| JsError::msg(format!("SpiderMonkey evaluation failed in {filename:?}")))
+    }
+
+    unsafe fn eval_to_string(
+        cx: &mut mozjs::context::JSContext,
+        global: mozjs::rust::HandleObject,
+        source: &str,
+        filename: &str,
+    ) -> Result<String, JsError> {
+        rooted!(&in(cx) let mut rval = UndefinedValue());
+        let filename =
+            std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
+        let options = CompileOptionsWrapper::new(cx, filename, 1);
+        evaluate_script(cx, global, source, rval.handle_mut(), options)
+            .map_err(|_| JsError::msg(format!("SpiderMonkey evaluation failed in {filename:?}")))?;
+        match String::from_jsval(cx.raw_cx(), rval.handle(), ()) {
+            Ok(ConversionResult::Success(s)) => Ok(s),
+            Ok(_) => Err(JsError::msg("SpiderMonkey result was not a string")),
+            Err(_) => Err(JsError::msg("failed to convert SpiderMonkey result to string")),
+        }
+    }
+
+    unsafe fn warm_up_fetch_handler(
+        cx: &mut mozjs::context::JSContext,
+        global: mozjs::rust::HandleObject,
+    ) -> Result<(), JsError> {
+        let req = serde_json::to_string(&RequestForJs {
+            method: "GET".to_owned(),
+            url: "http://localhost/__helios_warmup".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
+        .map_err(|e| JsError::msg(e.to_string()))?;
+        let literal = serde_json::to_string(&req).map_err(|e| JsError::msg(e.to_string()))?;
+        let script = format!(
+            "for (let i = 0; i < {JIT_WARMUP_ITERS}; i++) __helios_call_fetch({literal});"
+        );
+        eval(cx, global, &script, "helios-jit-warmup.js")
+    }
+
+    #[derive(Serialize)]
+    struct RequestForJs {
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl RequestForJs {
+        fn from_wire(req_bytes: &[u8]) -> Self {
+            let mut p = 0usize;
+            let method = read_str(req_bytes, &mut p).unwrap_or_else(|| "GET".to_owned());
+            let url = read_str(req_bytes, &mut p).unwrap_or_else(|| "/".to_owned());
+            let nh = read_u32(req_bytes, &mut p).unwrap_or(0);
+            let mut headers = Vec::with_capacity(nh as usize);
+            for _ in 0..nh {
+                let Some(k) = read_str(req_bytes, &mut p) else { break };
+                let Some(v) = read_bytes(req_bytes, &mut p) else { break };
+                headers.push((k, String::from_utf8_lossy(v).into_owned()));
+            }
+            let body = read_bytes(req_bytes, &mut p).unwrap_or_default().to_vec();
+            Self {
+                method,
+                url,
+                headers,
+                body,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct ResponseFromJs {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl ResponseFromJs {
+        fn to_wire(&self) -> Bytes {
+            let mut buf = BytesMut::with_capacity(6 + self.headers.len() * 64 + self.body.len());
+            buf.put_u16_le(self.status);
+            buf.put_u32_le(self.headers.len() as u32);
+            for (k, v) in &self.headers {
+                buf.put_u32_le(k.len() as u32);
+                buf.put_slice(k.as_bytes());
+                buf.put_u32_le(v.len() as u32);
+                buf.put_slice(v.as_bytes());
+            }
+            buf.put_u32_le(self.body.len() as u32);
+            buf.put_slice(self.body.as_bytes());
+            buf.freeze()
+        }
+    }
+
+    fn read_u32(b: &[u8], p: &mut usize) -> Option<u32> {
+        if *p + 4 > b.len() {
+            return None;
+        }
+        let v = u32::from_le_bytes(b[*p..*p + 4].try_into().ok()?);
+        *p += 4;
+        Some(v)
+    }
+
+    fn read_bytes<'a>(b: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
+        let n = read_u32(b, p)? as usize;
+        if *p + n > b.len() {
+            return None;
+        }
+        let s = &b[*p..*p + n];
+        *p += n;
+        Some(s)
+    }
+
+    fn read_str(b: &[u8], p: &mut usize) -> Option<String> {
+        Some(String::from_utf8_lossy(read_bytes(b, p)?).into_owned())
+    }
+
+    const HELIOS_BOOTSTRAP: &str = r#"
+        var __helios_fetch_handler = undefined;
+
+        function addEventListener(type, handler) {
+            if (type === 'fetch') {
+                __helios_fetch_handler = handler;
+            }
+        }
+
+        function Response(body, init) {
+            if (!(this instanceof Response)) {
+                return new Response(body, init);
+            }
+            this.body = (body === undefined || body === null) ? '' : String(body);
+            this.status = init && init.status !== undefined ? Number(init.status) : 200;
+            this.headers = init && init.headers && typeof init.headers === 'object'
+                ? init.headers
+                : {};
+        }
+
+        function __helios_assert_fetch_handler() {
+            if (typeof __helios_fetch_handler !== 'function') {
+                throw new Error("no fetch handler registered (call addEventListener('fetch', handler))");
+            }
+        }
+
+        function __helios_headers_to_pairs(headers) {
+            var pairs = [];
+            if (!headers || typeof headers !== 'object') {
+                return pairs;
+            }
+            var keys = Object.keys(headers);
+            for (var i = 0; i < keys.length; i++) {
+                pairs.push([String(keys[i]), String(headers[keys[i]])]);
+            }
+            return pairs;
+        }
+
+        function __helios_call_fetch(reqJson) {
+            __helios_assert_fetch_handler();
+            var req = JSON.parse(reqJson);
+            var captured = undefined;
+            var event = {
+                request: {
+                    method: String(req.method || 'GET'),
+                    url: String(req.url || '/'),
+                    headers: req.headers || [],
+                    body: req.body || []
+                },
+                respondWith: function(response) {
+                    captured = response;
+                }
+            };
+            __helios_fetch_handler(event);
+            if (captured && typeof captured.then === 'function') {
+                throw new Error('async fetch handlers are not yet supported by the SpiderMonkey backend');
+            }
+            if (!captured) {
+                throw new Error('fetch handler did not call event.respondWith()');
+            }
+            return JSON.stringify({
+                status: Number(captured.status || 200),
+                headers: __helios_headers_to_pairs(captured.headers),
+                body: captured.body === undefined || captured.body === null ? '' : String(captured.body)
+            });
+        }
+    "#;
 }
 #[cfg(feature = "spidermonkey")]
 pub use spidermonkey_backend::SpiderMonkeyEngine;

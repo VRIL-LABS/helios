@@ -214,7 +214,10 @@ impl XdrCache {
         if self.active.len() != 1 {
             return None;
         }
-        self.active.iter().next().map(|e| e.value().as_ref().clone())
+        self.active
+            .iter()
+            .next()
+            .map(|e| e.value().as_ref().clone())
     }
 
     /// Number of cached compilations.
@@ -377,7 +380,7 @@ mod spidermonkey_backend {
     }
 
     struct SmWorkerContext {
-        roots: RootedObjectVectorWrapper,
+        _roots: RootedObjectVectorWrapper,
         runtime: Runtime,
         global: *mut JSObject,
         generation: u32,
@@ -387,6 +390,8 @@ mod spidermonkey_backend {
         static WORKER_CONTEXTS: RefCell<HashMap<u32, SmWorkerContext>> =
             RefCell::new(HashMap::new());
     }
+
+    static ENGINE: OnceLock<usize> = OnceLock::new();
 
     impl std::fmt::Debug for SpiderMonkeyEngine {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -440,7 +445,7 @@ mod spidermonkey_backend {
                         eval(cx, global.handle(), &state.source, "helios-worker.js")?;
                         warm_up_fetch_handler(cx, global.handle())?;
                         SmWorkerContext {
-                            roots,
+                            _roots: roots,
                             runtime,
                             global: global.get(),
                             generation: state.generation,
@@ -531,7 +536,6 @@ mod spidermonkey_backend {
     }
 
     fn engine_handle() -> Result<JSEngineHandle, JsError> {
-        static ENGINE: OnceLock<usize> = OnceLock::new();
         let ptr = *ENGINE.get_or_init(|| match JSEngine::init() {
             Ok(engine) => Box::into_raw(Box::new(engine)) as usize,
             Err(_) => 0,
@@ -540,6 +544,13 @@ mod spidermonkey_backend {
             return Err(JsError::msg("failed to initialize SpiderMonkey engine"));
         }
         Ok(unsafe { (&*(ptr as *const JSEngine)).handle() })
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn shutdown_engine_for_tests() {
+        if let Some(ptr) = ENGINE.get().copied().filter(|ptr| *ptr != 0) {
+            drop(unsafe { Box::from_raw(ptr as *mut JSEngine) });
+        }
     }
 
     fn validate_module(source: &str) -> Result<(), JsError> {
@@ -556,7 +567,12 @@ mod spidermonkey_backend {
             ));
             eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
             eval(cx, global.handle(), source, "helios-worker.js")?;
-            eval(cx, global.handle(), "__helios_assert_fetch_handler()", "helios-validate.js")?;
+            eval(
+                cx,
+                global.handle(),
+                "__helios_assert_fetch_handler()",
+                "helios-validate.js",
+            )?;
         }
         Ok(())
     }
@@ -580,11 +596,14 @@ mod spidermonkey_backend {
         filename: &str,
     ) -> Result<(), JsError> {
         rooted!(&in(cx) let mut rval = UndefinedValue());
-        let filename =
-            std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
+        let filename_for_error = filename.to_owned();
+        let filename = std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
         let options = CompileOptionsWrapper::new(cx, filename, 1);
-        evaluate_script(cx, global, source, rval.handle_mut(), options)
-            .map_err(|_| JsError::msg(format!("SpiderMonkey evaluation failed in {filename:?}")))
+        evaluate_script(cx, global, source, rval.handle_mut(), options).map_err(|_| {
+            JsError::msg(format!(
+                "SpiderMonkey evaluation failed in {filename_for_error}"
+            ))
+        })
     }
 
     unsafe fn eval_to_string(
@@ -594,15 +613,20 @@ mod spidermonkey_backend {
         filename: &str,
     ) -> Result<String, JsError> {
         rooted!(&in(cx) let mut rval = UndefinedValue());
-        let filename =
-            std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
+        let filename_for_error = filename.to_owned();
+        let filename = std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
         let options = CompileOptionsWrapper::new(cx, filename, 1);
-        evaluate_script(cx, global, source, rval.handle_mut(), options)
-            .map_err(|_| JsError::msg(format!("SpiderMonkey evaluation failed in {filename:?}")))?;
-        match String::from_jsval(cx.raw_cx(), rval.handle(), ()) {
+        evaluate_script(cx, global, source, rval.handle_mut(), options).map_err(|_| {
+            JsError::msg(format!(
+                "SpiderMonkey evaluation failed in {filename_for_error}"
+            ))
+        })?;
+        match unsafe { String::from_jsval(cx.raw_cx(), rval.handle(), ()) } {
             Ok(ConversionResult::Success(s)) => Ok(s),
             Ok(_) => Err(JsError::msg("SpiderMonkey result was not a string")),
-            Err(_) => Err(JsError::msg("failed to convert SpiderMonkey result to string")),
+            Err(_) => Err(JsError::msg(
+                "failed to convert SpiderMonkey result to string",
+            )),
         }
     }
 
@@ -618,10 +642,9 @@ mod spidermonkey_backend {
         })
         .map_err(|e| JsError::msg(e.to_string()))?;
         let literal = serde_json::to_string(&req).map_err(|e| JsError::msg(e.to_string()))?;
-        let script = format!(
-            "for (let i = 0; i < {JIT_WARMUP_ITERS}; i++) __helios_call_fetch({literal});"
-        );
-        eval(cx, global, &script, "helios-jit-warmup.js")
+        let script =
+            format!("for (let i = 0; i < {JIT_WARMUP_ITERS}; i++) __helios_call_fetch({literal});");
+        unsafe { eval(cx, global, &script, "helios-jit-warmup.js") }
     }
 
     #[derive(Serialize)]
@@ -640,8 +663,12 @@ mod spidermonkey_backend {
             let nh = read_u32(req_bytes, &mut p).unwrap_or(0);
             let mut headers = Vec::with_capacity(nh as usize);
             for _ in 0..nh {
-                let Some(k) = read_str(req_bytes, &mut p) else { break };
-                let Some(v) = read_bytes(req_bytes, &mut p) else { break };
+                let Some(k) = read_str(req_bytes, &mut p) else {
+                    break;
+                };
+                let Some(v) = read_bytes(req_bytes, &mut p) else {
+                    break;
+                };
                 headers.push((k, String::from_utf8_lossy(v).into_owned()));
             }
             let body = read_bytes(req_bytes, &mut p).unwrap_or_default().to_vec();
@@ -816,5 +843,71 @@ mod tests {
         // Same Arc: second compile must hit the cache, not re-compile.
         assert!(Arc::ptr_eq(&e1.bytecode, &e2.bytecode));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[cfg(feature = "spidermonkey")]
+    #[test]
+    fn spidermonkey_fetch_round_trip() {
+        let eng = SpiderMonkeyEngine::new().unwrap();
+        let source = "addEventListener('fetch', event => event.respondWith(new Response('sm', { status: 201, headers: { 'x-engine': 'spidermonkey' } })))";
+        let xdr = eng.compile_to_xdr(source, "sm-test.js").unwrap();
+        let handle = eng.eval_xdr(xdr, "sm-test.js").unwrap();
+        let resp = eng
+            .call_fetch_handler(handle, build_test_request("GET", "http://localhost/", &[]))
+            .unwrap();
+        let (status, headers, body) = decode_test_response(&resp);
+        assert_eq!(status, 201);
+        assert_eq!(
+            headers,
+            vec![("x-engine".to_owned(), "spidermonkey".to_owned())]
+        );
+        assert_eq!(body, b"sm");
+        eng.drop_module(handle);
+        unsafe {
+            spidermonkey_backend::shutdown_engine_for_tests();
+        }
+    }
+
+    #[cfg(feature = "spidermonkey")]
+    fn build_test_request(method: &str, url: &str, headers: &[(&str, &str)]) -> Bytes {
+        use bytes::BufMut;
+        let mut buf = bytes::BytesMut::new();
+        buf.put_u32_le(method.len() as u32);
+        buf.put_slice(method.as_bytes());
+        buf.put_u32_le(url.len() as u32);
+        buf.put_slice(url.as_bytes());
+        buf.put_u32_le(headers.len() as u32);
+        for (k, v) in headers {
+            buf.put_u32_le(k.len() as u32);
+            buf.put_slice(k.as_bytes());
+            buf.put_u32_le(v.len() as u32);
+            buf.put_slice(v.as_bytes());
+        }
+        buf.put_u32_le(0);
+        buf.freeze()
+    }
+
+    #[cfg(feature = "spidermonkey")]
+    fn decode_test_response(bytes: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut p = 0usize;
+        let status = u16::from_le_bytes(bytes[p..p + 2].try_into().unwrap());
+        p += 2;
+        let nh = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let mut headers = Vec::with_capacity(nh);
+        for _ in 0..nh {
+            let klen = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let k = String::from_utf8_lossy(&bytes[p..p + klen]).into_owned();
+            p += klen;
+            let vlen = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let v = String::from_utf8_lossy(&bytes[p..p + vlen]).into_owned();
+            p += vlen;
+            headers.push((k, v));
+        }
+        let blen = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        (status, headers, bytes[p..p + blen].to_vec())
     }
 }

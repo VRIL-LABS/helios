@@ -70,8 +70,12 @@ impl HostState {
 }
 
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx { &mut self.wasi }
-    fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi
+    }
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
 }
 
 /// Builds a wasmtime [`Engine`] tuned for HELIOS: async, component-model,
@@ -98,8 +102,7 @@ pub fn build_engine() -> anyhow::Result<Engine> {
 /// embedder can call `Linker::instantiate_async`.
 pub fn build_linker(engine: &Engine) -> anyhow::Result<Linker<HostState>> {
     let mut linker = Linker::new(engine);
-    wasmtime_wasi::add_to_linker_async(&mut linker)
-        .context("add wasi to linker")?;
+    wasmtime_wasi::add_to_linker_async(&mut linker).context("add wasi to linker")?;
 
     add_js_engine_to_linker(&mut linker)?;
     Ok(linker)
@@ -122,8 +125,7 @@ fn add_js_engine_to_linker(linker: &mut Linker<HostState>) -> anyhow::Result<()>
         "eval-module",
         |mut store: wasmtime::StoreContextMut<'_, HostState>,
          (source, module_url): (String, String)|
-            -> wasmtime::Result<(Result<u32, String>,)>
-        {
+         -> wasmtime::Result<(Result<u32, String>,)> {
             let state = store.data_mut();
             let r = state.backend.eval_module(&source, &module_url);
             Ok((map_result(state, r),))
@@ -134,8 +136,7 @@ fn add_js_engine_to_linker(linker: &mut Linker<HostState>) -> anyhow::Result<()>
         "eval-xdr",
         |mut store: wasmtime::StoreContextMut<'_, HostState>,
          (xdr, module_url): (Vec<u8>, String)|
-            -> wasmtime::Result<(Result<u32, String>,)>
-        {
+         -> wasmtime::Result<(Result<u32, String>,)> {
             let state = store.data_mut();
             let r = state.backend.eval_xdr(Arc::from(xdr), &module_url);
             Ok((map_result(state, r),))
@@ -146,12 +147,13 @@ fn add_js_engine_to_linker(linker: &mut Linker<HostState>) -> anyhow::Result<()>
         "call-fetch-handler",
         |mut store: wasmtime::StoreContextMut<'_, HostState>,
          (handle, req): (u32, Vec<u8>)|
-            -> wasmtime::Result<(Result<Vec<u8>, String>,)>
-        {
+         -> wasmtime::Result<(Result<Vec<u8>, String>,)> {
             let state = store.data_mut();
             let module_handle = state.handles.get(&handle).map(|e| *e.value());
             let resp = match module_handle {
-                Some(h) => state.backend.call_fetch_handler(h, Bytes::from(req))
+                Some(h) => state
+                    .backend
+                    .call_fetch_handler(h, Bytes::from(req))
                     .map(|b| b.to_vec())
                     .map_err(|e| e.message),
                 None => Err(format!("unknown module handle {handle}")),
@@ -164,8 +166,7 @@ fn add_js_engine_to_linker(linker: &mut Linker<HostState>) -> anyhow::Result<()>
         "drain-microtasks",
         |mut store: wasmtime::StoreContextMut<'_, HostState>,
          (handle,): (u32,)|
-            -> wasmtime::Result<(Result<(), String>,)>
-        {
+         -> wasmtime::Result<(Result<(), String>,)> {
             let state = store.data_mut();
             let r = match state.handles.get(&handle).map(|e| *e.value()) {
                 Some(h) => state.backend.drain_microtasks(h).map_err(|e| e.message),
@@ -178,8 +179,8 @@ fn add_js_engine_to_linker(linker: &mut Linker<HostState>) -> anyhow::Result<()>
     iface.func_wrap(
         "gc-minor",
         |mut store: wasmtime::StoreContextMut<'_, HostState>,
-         (handle,): (u32,)| -> wasmtime::Result<()>
-        {
+         (handle,): (u32,)|
+         -> wasmtime::Result<()> {
             let state = store.data_mut();
             if let Some(h) = state.handles.get(&handle).map(|e| *e.value()) {
                 state.backend.gc_minor(h);
@@ -191,8 +192,8 @@ fn add_js_engine_to_linker(linker: &mut Linker<HostState>) -> anyhow::Result<()>
     iface.func_wrap(
         "drop-module",
         |mut store: wasmtime::StoreContextMut<'_, HostState>,
-         (handle,): (u32,)| -> wasmtime::Result<()>
-        {
+         (handle,): (u32,)|
+         -> wasmtime::Result<()> {
             let state = store.data_mut();
             if let Some((_, h)) = state.handles.remove(&handle) {
                 state.backend.drop_module(h);
@@ -204,9 +205,7 @@ fn add_js_engine_to_linker(linker: &mut Linker<HostState>) -> anyhow::Result<()>
     Ok(())
 }
 
-fn map_result(state: &HostState, r: Result<ModuleHandle, JsError>)
-    -> Result<u32, String>
-{
+fn map_result(state: &HostState, r: Result<ModuleHandle, JsError>) -> Result<u32, String> {
     match r {
         Ok(h) => {
             state.handles.insert(h.0, h);
@@ -217,16 +216,12 @@ fn map_result(state: &HostState, r: Result<ModuleHandle, JsError>)
 }
 
 /// Load a worker component from disk.
-pub fn load_worker_component(engine: &Engine, path: &std::path::Path)
-    -> anyhow::Result<Component>
-{
+pub fn load_worker_component(engine: &Engine, path: &std::path::Path) -> anyhow::Result<Component> {
     Component::from_file(engine, path)
         .with_context(|| format!("loading worker component at {}", path.display()))
 }
 
 /// Convenience: build a `Store` ready for instantiation.
-pub fn build_store(engine: &Engine, backend: Arc<dyn JsEngineBackend>)
-    -> Store<HostState>
-{
+pub fn build_store(engine: &Engine, backend: Arc<dyn JsEngineBackend>) -> Store<HostState> {
     Store::new(engine, HostState::new(backend))
 }

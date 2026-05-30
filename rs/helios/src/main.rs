@@ -16,12 +16,30 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use helios::bench;
+#[cfg(not(feature = "spidermonkey"))]
 use helios::boa_backend::BoaEngine;
 use helios::dispatcher::{DispatchPolicy, HeliosDispatcher};
 use helios::engine::JsEngineBackend;
 use helios::http3::{run_server, InlineEngine, ServerConfig, TlsConfig};
 use helios::wizer_build;
+#[cfg(feature = "spidermonkey")]
+use helios::xdr::SpiderMonkeyEngine;
 use helios::xdr::{UserCode, XdrCache};
+
+#[cfg(feature = "spidermonkey")]
+type ActiveEngine = SpiderMonkeyEngine;
+#[cfg(not(feature = "spidermonkey"))]
+type ActiveEngine = BoaEngine;
+
+#[cfg(feature = "spidermonkey")]
+fn new_engine() -> Result<ActiveEngine> {
+    SpiderMonkeyEngine::new().map_err(|err| anyhow::anyhow!("SpiderMonkey init failed: {err}"))
+}
+
+#[cfg(not(feature = "spidermonkey"))]
+fn new_engine() -> Result<ActiveEngine> {
+    Ok(BoaEngine::new())
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "helios", version, about = "HELIOS — JIT at the edge. Finally.")]
@@ -207,7 +225,7 @@ fn main() -> Result<()> {
 async fn cmd_serve(s: Serve) -> Result<()> {
     let user_code = UserCode::from_path(&s.js_path, s.script)?;
     let cache = Arc::new(XdrCache::new());
-    let bootstrap_engine = Arc::new(BoaEngine::new());
+    let bootstrap_engine = Arc::new(new_engine()?);
     cache.compile_user_code(bootstrap_engine.as_ref(), &user_code)?;
 
     let entry = cache
@@ -217,8 +235,7 @@ async fn cmd_serve(s: Serve) -> Result<()> {
         .eval_xdr(entry.bytecode.clone(), &entry.module_url)
         .map_err(|e| anyhow::anyhow!("inline engine warmup failed: {e}"))?;
 
-    let dispatcher =
-        HeliosDispatcher::spawn(s.workers, s.policy.into(), cache, || Ok(BoaEngine::new()))?;
+    let dispatcher = HeliosDispatcher::spawn(s.workers, s.policy.into(), cache, new_engine)?;
     tracing::info!(workers = dispatcher.worker_count(),
         policy = ?DispatchPolicy::from(s.policy), "dispatcher up");
 
@@ -305,7 +322,7 @@ fn cmd_exec(e: Exec) -> Result<()> {
     let source = std::fs::read_to_string(&e.js_path)
         .map_err(|err| anyhow::anyhow!("failed to read {}: {err}", e.js_path.display()))?;
     let module_url = e.js_path.display().to_string();
-    let engine = BoaEngine::new();
+    let engine = new_engine()?;
     engine
         .eval_module(&source, &module_url)
         .map_err(|err| anyhow::anyhow!("exec failed: {err}"))?;

@@ -864,7 +864,7 @@ mod spidermonkey_backend {
             if (!captured) {
                 throw new Error('fetch handler did not call event.respondWith()');
             }
-            if (typeof captured !== 'object' || captured === null) {
+            if (typeof captured !== 'object' || captured === null || Array.isArray(captured)) {
                 throw new Error('respondWith expects a Response object');
             }
             return JSON.stringify({

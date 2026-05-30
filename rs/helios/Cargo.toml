@@ -56,6 +56,9 @@ wizer = { workspace = true, optional = true }
 hdrhistogram.workspace = true
 reqwest.workspace = true
 
+# JS execution (Boa)
+boa_engine.workspace = true
+
 # Misc
 anyhow.workspace = true
 thiserror.workspace = true

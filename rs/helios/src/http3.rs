@@ -189,7 +189,8 @@ async fn serve_static_h1_connection(
     stream: &mut tokio::net::TcpStream,
     response: &[u8],
 ) -> Result<()> {
-    let mut buf = [0u8; 16 * 1024];
+    // 64KB buffer allows reading many pipelined requests per syscall.
+    let mut buf = [0u8; 64 * 1024];
     let mut len = 0usize;
     let mut header_scan = 0usize;
     loop {
@@ -205,6 +206,10 @@ async fn serve_static_h1_connection(
         }
         len += n;
 
+        // Process all complete requests in the buffer before reading again.
+        // Batch responses: count how many complete requests are available and
+        // write all responses in a single syscall when possible.
+        let mut requests_ready = 0u32;
         while let Some(header_end) = find_header_end_from(&buf[..len], header_scan) {
             let headers = &buf[..header_end];
             let body_len = h1_request_body_len(headers);
@@ -213,9 +218,7 @@ async fn serve_static_h1_connection(
                 header_scan = header_end;
                 break;
             }
-            write_all_fast(stream, response)
-                .await
-                .context("write h1 response")?;
+            requests_ready += 1;
 
             if request_len == len {
                 len = 0;
@@ -225,6 +228,25 @@ async fn serve_static_h1_connection(
             buf.copy_within(request_len..len, 0);
             len -= request_len;
             header_scan = 0;
+        }
+
+        // Write all pending responses in one batch.
+        if requests_ready > 0 {
+            if requests_ready == 1 {
+                write_all_fast(stream, response)
+                    .await
+                    .context("write h1 response")?;
+            } else {
+                // Batch write: repeat the response N times into a single buffer.
+                let batch_len = response.len() * requests_ready as usize;
+                let mut batch = Vec::with_capacity(batch_len);
+                for _ in 0..requests_ready {
+                    batch.extend_from_slice(response);
+                }
+                write_all_fast(stream, &batch)
+                    .await
+                    .context("write h1 batch response")?;
+            }
         }
 
         if find_header_end_from(&buf[..len], header_scan).is_none() {

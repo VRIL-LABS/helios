@@ -1,0 +1,10 @@
+# Build artifacts
+rs/target/
+target/
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

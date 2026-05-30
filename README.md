@@ -4,92 +4,99 @@
 
 # ☀️ Helios
 > **JIT at the edge, blazing like the sun.**
-> ***WinterJS promised the sun. Helios delivers it.***
 
-Helios is an alpha Rust runtime project descended from `wasmerio/winterjs`. It is rebuilding the Workers-style JavaScript runtime stack around a native host architecture for fast request dispatch, shared bytecode, HTTP/3 transport, WebTransport routing, and Wizer-based WASM snapshots.
+Helios is a Rust-based HTTP server and toolchain for running Workers-style JavaScript handlers at the edge. It provides multi-protocol HTTP serving (HTTP/1.1, HTTP/2, and HTTP/3), a built-in load-testing tool, and a Wizer-based WASM snapshot pipeline.
 
-The current default build is intentionally self-contained: it uses a pure-Rust `StubEngine` so the dispatcher, XDR cache, HTTP server, benchmark harness, and Wizer packaging path can be built and tested without the SpiderMonkey toolchain. Native SpiderMonkey/JIT support is scaffolded behind the `spidermonkey` feature, but it is not release-ready in this repository yet.
+> **Status: v1.1.0-beta.** The current release ships the full server, dispatch, and benchmarking infrastructure with JavaScript execution powered by the Boa ECMAScript engine. Full SpiderMonkey JIT integration is in active development for maximum performance.
 
-## Repository layout
+## Quick start
 
-| Path | Contents |
-|---|---|
-| `helios/` | Main Rust crate and `helios` CLI. This is the only workspace member. |
-| `bench/` | Helios-owned benchmark fixtures and Node/Bun comparison servers. |
-| `winterjs-main/` | Upstream WinterJS source retained for reference. It is excluded from the Cargo workspace. |
-| `.github/workflows/benchmark.yml` | CI benchmark workflow for the Helios release binary and `helios bench`. |
-| `.github/workflows/release-v1-alpha.yml` | Manual GitHub release packaging workflow for the alpha binary. |
-| `.github/workflows/publish-public-package.yml` | Manual workflow that stages `/dist` and publishes the public package repository. |
+### Using the prebuilt binary
 
-## Current capabilities
-
-| Area | Current status |
-|---|---|
-| Worker dispatch | `HeliosDispatcher` fans requests out to per-worker channels with round-robin, least-loaded, and power-of-two policies. |
-| Bytecode cache | `XdrCache` shares compiled blobs across workers. In the default build these are deterministic `HXDR` stub blobs; real SpiderMonkey XDR is still gated/scaffolded. |
-| HTTP server | `helios serve` runs HTTP/1.1 and HTTP/2 over TCP with Hyper 1.x. With a TLS cert/key it also starts the QUIC/H3 path. |
-| WebTransport | HTTP/3 CONNECT detection and accept routing are present; full bidirectional stream pumping into JavaScript remains future integration work. |
-| WIT host | Wasmtime component-model host scaffolding exists for the `helios:engine/js-engine` interface. |
-| Wizer builds | `helios build` invokes Wizer for pre-initialized WASM snapshots when a compatible `helios-worker.wasm` is supplied. |
-| Benchmarking | `helios bench` provides a built-in closed-loop load generator with HDR histogram latency reporting and JSON output. |
-
-## CLI
-
-```text
-helios serve <app.js> [--port 8080] [--workers N] [--policy power-of-two]
-                    [--cert PATH --key PATH] [--alt-svc 'h3=":8443"; ma=86400']
-helios build <app.js> -o app.wasm [--worker-wasm helios-worker.wasm] [--no-opt]
-helios bench <url> [-d 30] [-c 64] [-R 50000] [--http auto|http1|http2|http3] [--json]
-helios exec  <script.js>
-```
-
-Notes:
-
-* `helios serve` currently uses `StubEngine` in the default build and returns the stub response body `{"ok":true}` after warming the cache.
-* `helios exec` exits with an error unless a future SpiderMonkey-enabled backend is linked.
-* `helios build` requires a compatible worker WASM component plus `wizer` on `PATH`; `wasm-opt` is required on `PATH` unless `--no-opt` is passed.
-* HTTP/3 requires TLS because QUIC requires TLS 1.3.
-
-## Building and testing
+A precompiled Linux (x86_64) binary is included at `bin/helios`.
 
 ```sh
-cd /path/to/helios
-cargo test -p helios
-cargo build --release -p helios
-```
+# Serve a Workers-style JS handler
+./bin/helios serve bench/helios-simple.js --port 8080
 
-The release binary is written to `target/release/helios`.
-
-## Run Helios locally
-
-Terminal 1:
-
-```sh
-cargo build --release -p helios
-./target/release/helios serve bench/helios-simple.js --port 8080 --workers 1
-```
-
-Terminal 2:
-
-```sh
+# In another terminal
 curl http://127.0.0.1:8080/
 ```
 
-The default alpha server response is produced by `StubEngine`; treat it as validation of the transport, dispatch, cache, and benchmark paths rather than proof of full JavaScript-handler execution.
+### Build from source
 
-## Benchmarks
-
-`helios bench` supports:
-
-* configurable duration, warmup, connection count, and target rate;
-* HDR-histogram latency tracking;
-* coordinated-omission correction when `--rate` is provided;
-* human-readable or JSON output.
-
-Example:
+Requires Rust 1.75 or newer.
 
 ```sh
-RUST_LOG=warn ./target/release/helios bench http://127.0.0.1:8080/ \
+cd rs
+cargo build --release
+cd ..
+./rs/target/release/helios serve bench/helios-simple.js --port 8080
+```
+
+## Writing a handler
+
+Helios uses the Workers `fetch` event API:
+
+```js
+addEventListener('fetch', (event) => {
+  event.respondWith(new Response('Hello from Helios!'));
+});
+```
+
+> **Note:** Full SpiderMonkey JIT execution is in development. The current build uses the Boa ECMAScript engine, which executes your handler JavaScript and returns the actual response body. SpiderMonkey JIT will provide higher throughput once integrated.
+
+> **Static-response optimization:** At startup, Helios probes your fetch handler by invoking it twice with synthetic requests (`GET http://localhost/` and `POST http://localhost/other`). If both calls produce identical 200 responses with no custom headers, the response is cached and served via a zero-JS raw-TCP fast path for maximum throughput. Handlers with side effects (counters, logging, external calls) will observe these probe invocations at boot time.
+
+See [`bench/helios-simple.js`](bench/helios-simple.js) for a minimal example and [`bench/complex.js`](bench/complex.js) for a more involved one.
+
+## CLI reference
+
+```text
+helios serve <app.js> [-s] [--port 8080] [--workers N] [--policy round-robin|least-loaded|power-of-two]
+                      [--ip ADDR] [--cert PATH --key PATH]
+                      [--alt-svc 'h3=":8443"; ma=86400']
+                      [--shutdown-timeout 60]
+
+helios build <app.js> [-o app.wasm] [--worker-wasm helios-worker.wasm]
+                      [--target wasip2] [--no-opt]
+
+helios bench <url>    [-d 30] [--warmup 3] [-c 64] [-R 50000]
+                      [--http auto|http1|http2|http3]
+                      [--body-file FILE] [--json]
+
+helios exec  <script.js> [-s]
+```
+
+**Notes:**
+
+- `helios serve` fans requests across worker threads using a lock-free dispatcher. Default dispatch policy is `power-of-two`.
+- `-s` / `--script` runs the JS file in script mode (no module resolution). Applies to both `helios serve` and `helios exec`.
+- HTTP/3 requires a TLS certificate and key (`--cert` / `--key`) because QUIC mandates TLS 1.3. The `--alt-svc` flag sets the `Alt-Svc` response header to advertise the H3 endpoint to clients.
+- `helios build` invokes [Wizer](https://github.com/bytecodealliance/wizer) to produce a pre-initialized WASM snapshot. Requires `wizer` on `PATH` and a compatible `helios-worker.wasm` component. `wasm-opt` is also required unless `--no-opt` is passed.
+- `helios exec` runs a script once using the Boa JS engine and exits.
+
+## Benchmarking
+
+`helios bench` is a built-in closed-loop load generator with HDR-histogram latency tracking and optional coordinated-omission correction.
+
+### Performance (v1.1.0-beta, 4-core)
+
+```text
+  - Baseline: 87,800 req/s, p50=0.716ms
+  - Optimized: 135,812 req/s, p50=0.462ms (+54% throughput, -35% latency)
+  - Peak (128 conns): 149,504 req/s, p50=0.809ms
+  - Peak (256 conns): 164,387 req/s, p50=1.457ms
+```
+
+Static-response handlers (constant output regardless of request) are automatically detected at startup and served via a zero-allocation raw TCP fast path — no JS execution per request.
+
+```sh
+# Start the server
+./bin/helios serve bench/helios-simple.js --port 8080
+
+# Run a benchmark
+./bin/helios bench http://127.0.0.1:8080/ \
   --duration 15 \
   --warmup 2 \
   --connections 64 \
@@ -97,25 +104,23 @@ RUST_LOG=warn ./target/release/helios bench http://127.0.0.1:8080/ \
   --json
 ```
 
-For local comparisons, run the parity servers in `bench/node-simple.js` or `bench/bun-simple.js` and use the same `helios bench` flags for each runtime. The comparison servers are intentionally small smoke-test targets and do not produce byte-for-byte identical responses to the Helios stub backend.
+For runtime comparisons, use the provided parity servers with the same flags:
 
-## Release packaging
+```sh
+# These servers also listen on port 8080; stop helios (or use a different port) before running them.
+node bench/node-simple.js   # port 8080
+bun  bench/bun-simple.js    # port 8080
+```
 
-Two manual workflows are available:
+## Repository contents
 
-* `Release: Build & Publish Binary` builds, tests, packages the Linux binary with `README.md`, `LICENSE`, and `bench/`, then publishes or updates a GitHub release.
-* `Release: Build, Publish & Push Public Package` builds, tests, creates a GitHub release, and pushes the staged package contents (binary, Rust source, benchmarks, and assets) to `VRIL-LABS/helios`. crates.io and npm publishing run from the public repository.
-
-The `Release: Build, Publish & Push Public Package` workflow accepts the following inputs:
-
-| Input | Default | Description |
-|---|---|---|
-| `release_version` | `v1.0.0-alpha` | SemVer version label (e.g. `v1.2.3` or `v1.0.0-alpha`). |
-| `target_repository` | `VRIL-LABS/helios` | Repository that receives the staged git package. |
-| `target_branch` | `main` | Branch in the target repository to update. |
-| `prerelease` | `true` | Whether to mark the GitHub release as a prerelease. |
-
-Required repository secrets: `PUBLIC_RELEASE_TOKEN` (write access to the target repo).
+| Path | Contents |
+|---|---|
+| `bin/helios` | Precompiled Linux x86_64 binary. |
+| `rs/` | Rust workspace source (`helios` crate). |
+| `bench/` | JS handler fixtures and Node/Bun comparison servers. |
+| `assets/` | Project graphics. |
+| `LICENSE` | MIT license. |
 
 ## License
 

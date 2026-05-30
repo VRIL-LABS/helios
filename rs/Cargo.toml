@@ -57,6 +57,9 @@ wizer = { version = "7", default-features = false }
 hdrhistogram = "7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream", "json"] }
 
+# --- JS execution engine (Boa) ---
+boa_engine = { version = "0.21", features = ["annex-b"] }
+
 # --- Misc ---
 anyhow = "1"
 thiserror = "1"

@@ -350,19 +350,21 @@ mod spidermonkey_backend {
     use std::sync::OnceLock;
 
     use bytes::{BufMut, BytesMut};
-    use mozjs::conversions::{ConversionResult, FromJSValConvertible};
-    use mozjs::jsapi::{JSObject, OnNewGlobalHookOption};
+    use mozjs::conversions::{ConversionResult, FromJSValConvertible, ToJSValConvertible};
+    use mozjs::jsapi::{HandleValueArray, JSObject, OnNewGlobalHookOption};
     use mozjs::jsval::UndefinedValue;
+    use mozjs::realm::AutoRealm;
     use mozjs::rooted;
-    use mozjs::rust::wrappers2::JS_NewGlobalObject;
+    use mozjs::rust::wrappers2::{JS_CallFunctionName, JS_NewGlobalObject};
     use mozjs::rust::{
-        evaluate_script, CompileOptionsWrapper, JSEngine, JSEngineHandle, RealmOptions,
+        evaluate_script, CompileOptionsWrapper, IntoHandle, JSEngine, JSEngineHandle, RealmOptions,
         RootedObjectVectorWrapper, Runtime, SIMPLE_GLOBAL_CLASS,
     };
     use serde::{Deserialize, Serialize};
 
     const SM_MAGIC: &[u8] = b"HSMJ";
     const JIT_WARMUP_ITERS: usize = 128;
+    const CALL_FETCH_NAME: &[u8] = b"__helios_call_fetch\0";
 
     /// Production engine backed by native SpiderMonkey through the `mozjs`
     /// crate.  SpiderMonkey's own `jit` crate feature is enabled by default,
@@ -494,10 +496,6 @@ mod spidermonkey_backend {
             let req = RequestForJs::from_wire(&b);
             let req_json = serde_json::to_string(&req)
                 .map_err(|e| JsError::msg(format!("failed to serialize request: {e}")))?;
-            let req_literal = serde_json::to_string(&req_json)
-                .map_err(|e| JsError::msg(format!("failed to quote request: {e}")))?;
-            let script = format!("__helios_call_fetch({req_literal})");
-
             let resp_json = WORKER_CONTEXTS.with(|contexts| {
                 let mut contexts = contexts.borrow_mut();
                 let ctx = contexts
@@ -506,7 +504,7 @@ mod spidermonkey_backend {
                 let cx = ctx.runtime.cx();
                 unsafe {
                     rooted!(&in(cx) let global = ctx.global);
-                    eval_to_string(cx, global.handle(), &script, "helios-fetch.js")
+                    call_fetch_json_to_string(cx, global.handle(), &req_json, "helios-fetch.js")
                 }
             })?;
 
@@ -624,15 +622,8 @@ mod spidermonkey_backend {
             body: Vec::new(),
         })
         .map_err(|e| JsError::msg(e.to_string()))?;
-        let literal = serde_json::to_string(&req).map_err(|e| JsError::msg(e.to_string()))?;
-        let resp_json = unsafe {
-            eval_to_string(
-                cx,
-                global,
-                &format!("__helios_call_fetch({literal})"),
-                "helios-static-probe.js",
-            )
-        }?;
+        let resp_json =
+            unsafe { call_fetch_json_to_string(cx, global, &req, "helios-static-probe.js") }?;
         serde_json::from_str(&resp_json)
             .map_err(|e| JsError::msg(format!("invalid probe response: {e}")))
     }
@@ -666,21 +657,33 @@ mod spidermonkey_backend {
         })
     }
 
-    unsafe fn eval_to_string(
+    unsafe fn call_fetch_json_to_string(
         cx: &mut mozjs::context::JSContext,
         global: mozjs::rust::HandleObject,
-        source: &str,
-        filename: &str,
+        req_json: &str,
+        filename_for_error: &str,
     ) -> Result<String, JsError> {
+        let mut realm = AutoRealm::new_from_handle(cx, global);
+        let cx = &mut *realm;
+        rooted!(&in(cx) let mut req_arg = UndefinedValue());
+        unsafe {
+            req_json.to_jsval(cx.raw_cx(), req_arg.handle_mut());
+        }
+        let args = HandleValueArray::from(req_arg.handle().into_handle());
         rooted!(&in(cx) let mut rval = UndefinedValue());
-        let filename_for_error = filename.to_owned();
-        let filename = std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
-        let options = CompileOptionsWrapper::new(cx, filename, 1);
-        evaluate_script(cx, global, source, rval.handle_mut(), options).map_err(|_| {
-            JsError::msg(format!(
+        if !unsafe {
+            JS_CallFunctionName(
+                cx,
+                global,
+                CALL_FETCH_NAME.as_ptr() as *const std::os::raw::c_char,
+                &args,
+                rval.handle_mut(),
+            )
+        } {
+            return Err(JsError::msg(format!(
                 "SpiderMonkey evaluation failed in {filename_for_error}"
-            ))
-        })?;
+            )));
+        }
         match unsafe { String::from_jsval(cx.raw_cx(), rval.handle(), ()) } {
             Ok(ConversionResult::Success(s)) => Ok(s),
             Ok(_) => Err(JsError::msg("SpiderMonkey result was not a string")),

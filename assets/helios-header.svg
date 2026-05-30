@@ -74,6 +74,11 @@
       <feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="#ffaa00" flood-opacity=".82"/>
     </filter>
 
+    <linearGradient id="starTrail" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#fffde0" stop-opacity=".95"/>
+      <stop offset="100%" stop-color="#fffde0" stop-opacity="0"/>
+    </linearGradient>
+
     <clipPath id="windowClip">
       <rect x="160" y="72" width="1080" height="296" rx="56"/>
     </clipPath>
@@ -88,7 +93,7 @@
 
     <style>
       @media (prefers-reduced-motion: reduce) {
-        .ray, .spark, .orb, .shine { animation: none !important; }
+        .ray, .spark, .orb, .shine, .sstar, .ufo-anim { animation: none !important; }
       }
 
       .ray {
@@ -144,12 +149,99 @@
         0%, 100% { transform: translateX(-150px) rotate(-9deg); opacity: .08; }
         46%, 58% { transform: translateX(150px) rotate(-9deg); opacity: .42; }
       }
+
+      .sstar, .ufo-anim {
+        opacity: 0;
+      }
+
+      @keyframes shootStar {
+        0%   { transform: translateX(0);      opacity: 0; }
+        4%   { opacity: .88; }
+        16%  { transform: translateX(-420px); opacity: 0; }
+        100% { transform: translateX(-420px); opacity: 0; }
+      }
+
+      @keyframes ufoFly {
+        0%, 4.9%  { transform: translateX(1380px); opacity: 0; }
+        5%        { transform: translateX(1280px); opacity: 1; }
+        5.8%      { transform: translateX(1180px); opacity: .80; }
+        13%       { transform: translateX(150px);  opacity: .80; }
+        14.5%     { transform: translateX(144px);  opacity: 0; }
+        100%      { transform: translateX(144px);  opacity: 0; }
+      }
+
+      @keyframes portalOpen {
+        0%, 11%   { transform: scale(0);   opacity: 0; }
+        13%       { transform: scale(1);   opacity: .76; }
+        14.2%     { transform: scale(1.6); opacity: .38; }
+        15.5%     { transform: scale(2.5); opacity: 0; }
+        100%      { transform: scale(2.5); opacity: 0; }
+      }
     </style>
   </defs>
 
   <rect width="1400" height="440" fill="url(#sky)"/>
   <path d="M0 332C151 267 244 291 365 330c150 49 244-23 376-54 174-41 274 65 420 60 102-3 169-44 239-92v196H0Z" fill="#150d2d" opacity=".42"/>
   <path d="M0 359c177-68 314-29 459-6 174 28 294-69 452-61 181 9 252 91 489 17v131H0Z" fill="#09051a" opacity=".52"/>
+
+  <!-- Shooting stars — rendered behind sun, rays, and window -->
+  <g id="shootingStars">
+    <g transform="translate(1080,28) rotate(-35)">
+      <rect class="sstar" x="0" y="-1.2" width="160" height="2.4" rx="1.2"
+            fill="url(#starTrail)"
+            style="animation:shootStar 24s ease-in -1s infinite;"/>
+    </g>
+    <g transform="translate(780,15) rotate(-32)">
+      <rect class="sstar" x="0" y="-1" width="130" height="2" rx="1"
+            fill="url(#starTrail)"
+            style="animation:shootStar 31s ease-in -9s infinite;"/>
+    </g>
+    <g transform="translate(1260,55) rotate(-38)">
+      <rect class="sstar" x="0" y="-1.3" width="180" height="2.6" rx="1.3"
+            fill="url(#starTrail)"
+            style="animation:shootStar 19s ease-in -5s infinite;"/>
+    </g>
+    <g transform="translate(580,8) rotate(-30)">
+      <rect class="sstar" x="0" y="-1" width="120" height="2" rx="1"
+            fill="url(#starTrail)"
+            style="animation:shootStar 27s ease-in -18s infinite;"/>
+    </g>
+    <g transform="translate(950,70) rotate(-36)">
+      <rect class="sstar" x="0" y="-1.1" width="145" height="2.2" rx="1.1"
+            fill="url(#starTrail)"
+            style="animation:shootStar 22s ease-in -13s infinite;"/>
+    </g>
+  </g>
+
+  <!-- Flying saucer — rare warp event in sky (~1× per 65 s), behind all foreground -->
+  <g id="ufoScene" transform="translate(0,48)">
+    <!-- Saucer + contrails (translate across sky right→left) -->
+    <g class="ufo-anim" style="animation:ufoFly 65s ease-in 0s infinite;">
+      <!-- Contrails trailing to the right as saucer moves left -->
+      <rect x="18" y="-1"   width="210" height="2"   rx="1"   fill="url(#starTrail)" opacity=".52"/>
+      <rect x="18" y="3.5"  width="150" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".28"/>
+      <rect x="18" y="-4.5" width="115" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".22"/>
+      <!-- Saucer body -->
+      <ellipse cx="0" cy="0"  rx="22" ry="7"  fill="#fffde0" opacity=".84"/>
+      <!-- Dome -->
+      <ellipse cx="0" cy="-6" rx="10" ry="5"  fill="#fffde0" opacity=".68"/>
+      <!-- Window -->
+      <circle  cx="0" cy="-6" r="2.5"          fill="#fffde0" opacity=".42"/>
+      <!-- Belly glow stripe -->
+      <rect x="-18" y="5" width="36" height="1.5" rx=".75"   fill="#fffde0" opacity=".36"/>
+    </g>
+    <!-- Portal ring — expands at saucer exit point (x=150) -->
+    <g transform="translate(150,0)">
+      <circle cx="0" cy="0" r="20" fill="none" stroke="#fffde0" stroke-width="1.6"
+              class="ufo-anim"
+              style="animation:portalOpen 65s ease-out 0s infinite;
+                     transform-box:fill-box; transform-origin:center;"/>
+      <circle cx="0" cy="0" r="12" fill="none" stroke="#fffde0" stroke-width=".8" opacity=".55"
+              class="ufo-anim"
+              style="animation:portalOpen 65s ease-out 0s infinite;
+                     transform-box:fill-box; transform-origin:center;"/>
+    </g>
+  </g>
 
   <g class="orb">
     <circle cx="700" cy="226" r="250" fill="url(#sunGlow)" filter="url(#softBlur)"/>
@@ -179,7 +271,7 @@
     <rect x="130" y="44" width="1140" height="352" fill="#fff" opacity=".08" filter="url(#glassBlur)"/>
     <circle cx="700" cy="226" r="220" fill="#fff6bd" opacity=".18" filter="url(#softBlur)"/>
     <path class="shine" d="M195 0h188l-238 440H-43Z" fill="#fff" opacity=".22"/>
-    <path class="shine" d="M1064 42h82L888 386h-85Z" fill="#fff" opacity=".16" style="animation-delay:-3s"/>
+    <path class="shine" d="M1064 0h82L888 440h-85Z" fill="#fff" opacity=".16" style="animation-delay:-3s"/>
     <rect width="1400" height="440" fill="url(#grain)" opacity=".45"/>
   </g>
 
@@ -238,13 +330,6 @@
         font-size="13.5" font-weight="700" letter-spacing=".5"
         filter="url(#tagShadow)">WASM Snapshots</text>
 
-  <!-- "by VRIL LABS" attribution -->
-  <text x="1186" y="351" text-anchor="end"
-        fill="#ffd88b"
-        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="9.5" font-weight="600" letter-spacing="2.8"
-        opacity=".62" filter="url(#tagShadow)">by VRIL LABS</text>
-
   <!-- Achievement starburst badges -->
   <polygon points="262,101 276,120 300,117 297,141 316,155 297,170 300,193 276,190 262,209 248,190 224,193 227,170 208,155 227,141 224,117 248,120"
            fill="url(#achieveBadge)" stroke="#ffd040" stroke-width="2" filter="url(#achieveGlow)"/>
@@ -278,5 +363,12 @@
         font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
         font-size="13.5" font-weight="800" letter-spacing=".5"
         filter="url(#tagShadow)">Latency!</text>
+
+  <!-- "by VRIL LABS" attribution — above window layer -->
+  <text x="1186" y="351" text-anchor="end"
+        fill="#ffd88b"
+        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="9.5" font-weight="600" letter-spacing="2.8"
+        opacity=".62" filter="url(#tagShadow)">by VRIL LABS</text>
 
 </svg>

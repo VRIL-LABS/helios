@@ -347,6 +347,7 @@ mod spidermonkey_backend {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::ptr;
+    use std::sync::atomic::AtomicU64;
     use std::sync::OnceLock;
 
     use bytes::{BufMut, BytesMut};
@@ -366,11 +367,14 @@ mod spidermonkey_backend {
     const JIT_WARMUP_ITERS: usize = 128;
     const CALL_FETCH_NAME: &[u8] = b"__helios_call_fetch\0";
 
+    static NEXT_SM_ENGINE_ID: AtomicU64 = AtomicU64::new(0);
+
     /// Production engine backed by native SpiderMonkey through the `mozjs`
     /// crate.  SpiderMonkey's own `jit` crate feature is enabled by default,
     /// so hot fetch handlers can tier up in the native runtime instead of
     /// executing inside a Wasm sandbox without executable pages.
     pub struct SpiderMonkeyEngine {
+        engine_id: u64,
         next_handle: AtomicU32,
         modules: DashMap<u32, ModuleState>,
         static_responses: DashMap<u32, Bytes>,
@@ -390,7 +394,7 @@ mod spidermonkey_backend {
     }
 
     thread_local! {
-        static WORKER_CONTEXTS: RefCell<HashMap<u32, SmWorkerContext>> =
+        static WORKER_CONTEXTS: RefCell<HashMap<(u64, u32), SmWorkerContext>> =
             RefCell::new(HashMap::new());
     }
 
@@ -399,6 +403,7 @@ mod spidermonkey_backend {
     impl std::fmt::Debug for SpiderMonkeyEngine {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("SpiderMonkeyEngine")
+                .field("engine_id", &self.engine_id)
                 .field("modules", &self.modules.len())
                 .finish()
         }
@@ -408,6 +413,7 @@ mod spidermonkey_backend {
         pub fn new() -> Result<Self, JsError> {
             let _ = engine_handle()?;
             Ok(Self {
+                engine_id: NEXT_SM_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
                 next_handle: AtomicU32::new(0),
                 modules: DashMap::new(),
                 static_responses: DashMap::new(),
@@ -421,11 +427,12 @@ mod spidermonkey_backend {
                 .map_err(|_| JsError::msg("module handle counter overflowed u32"))
         }
 
-        fn ensure_context(handle: u32, state: &ModuleState) -> Result<(), JsError> {
+        fn ensure_context(engine_id: u64, handle: u32, state: &ModuleState) -> Result<(), JsError> {
             WORKER_CONTEXTS.with(|contexts| {
                 let mut contexts = contexts.borrow_mut();
+                let key = (engine_id, handle);
                 let stale = contexts
-                    .get(&handle)
+                    .get(&key)
                     .map(|ctx| ctx.generation != state.generation)
                     .unwrap_or(true);
 
@@ -455,7 +462,7 @@ mod spidermonkey_backend {
                             generation: state.generation,
                         }
                     };
-                    contexts.insert(handle, global);
+                    contexts.insert(key, global);
                 }
                 Ok(())
             })
@@ -491,15 +498,17 @@ mod spidermonkey_backend {
                 .get(&h.0)
                 .ok_or_else(|| JsError::msg(format!("unknown handle {}", h.0)))?
                 .clone();
-            Self::ensure_context(h.0, &state)?;
+            let engine_id = self.engine_id;
+            Self::ensure_context(engine_id, h.0, &state)?;
 
             let req = RequestForJs::from_wire(&b);
             let req_json = serde_json::to_string(&req)
                 .map_err(|e| JsError::msg(format!("failed to serialize request: {e}")))?;
+            let key = (engine_id, h.0);
             let resp_json = WORKER_CONTEXTS.with(|contexts| {
                 let mut contexts = contexts.borrow_mut();
                 let ctx = contexts
-                    .get_mut(&h.0)
+                    .get_mut(&key)
                     .ok_or_else(|| JsError::msg(format!("missing SpiderMonkey context {}", h.0)))?;
                 let cx = ctx.runtime.cx();
                 unsafe {
@@ -522,8 +531,9 @@ mod spidermonkey_backend {
         fn drop_module(&self, h: ModuleHandle) {
             self.modules.remove(&h.0);
             self.static_responses.remove(&h.0);
+            let key = (self.engine_id, h.0);
             WORKER_CONTEXTS.with(|contexts| {
-                contexts.borrow_mut().remove(&h.0);
+                contexts.borrow_mut().remove(&key);
             });
         }
 
@@ -683,7 +693,7 @@ mod spidermonkey_backend {
             )
         } {
             return Err(JsError::msg(format!(
-                "SpiderMonkey evaluation failed in {filename_for_error}"
+                "SpiderMonkey dispatch failed in {filename_for_error}"
             )));
         }
         match unsafe { String::from_jsval(cx.raw_cx(), rval.handle(), ()) } {

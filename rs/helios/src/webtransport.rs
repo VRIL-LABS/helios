@@ -38,7 +38,9 @@ use crate::dispatcher::{HeliosDispatcher, Protocol, RequestData};
 ///   :protocol = webtransport
 ///   :scheme = https
 pub fn is_webtransport_connect(req: &Request<()>) -> bool {
-    if req.method() != http::Method::CONNECT { return false; }
+    if req.method() != http::Method::CONNECT {
+        return false;
+    }
     // The `:protocol` pseudo-header is exposed in h3 via an extension
     // header named `:protocol`. h3 surfaces this as a regular header on
     // the request map.
@@ -59,8 +61,7 @@ pub async fn handle_session<S>(
     req: Request<()>,
     mut stream: h3::server::RequestStream<S, Bytes>,
     dispatcher: Arc<HeliosDispatcher>,
-)
-where
+) where
     S: h3::quic::BidiStream<Bytes>,
 {
     // 1. Tell JS about the session.
@@ -102,8 +103,10 @@ fn encode_connect_envelope(req: &Request<()>) -> Bytes {
     for (k, v) in req.headers().iter() {
         let kb = k.as_str().as_bytes();
         let vb = v.as_bytes();
-        out.put_u32_le(kb.len() as u32); out.put_slice(kb);
-        out.put_u32_le(vb.len() as u32); out.put_slice(vb);
+        out.put_u32_le(kb.len() as u32);
+        out.put_slice(kb);
+        out.put_u32_le(vb.len() as u32);
+        out.put_slice(vb);
     }
     let path = req.uri().path();
     out.put_u32_le(path.len() as u32);

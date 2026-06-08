@@ -51,7 +51,9 @@ pub enum BuildTarget {
 
 impl BuildTarget {
     pub fn as_str(&self) -> &'static str {
-        match self { BuildTarget::Wasip2 => "wasm32-wasip2" }
+        match self {
+            BuildTarget::Wasip2 => "wasm32-wasip2",
+        }
     }
 }
 
@@ -78,11 +80,16 @@ pub fn build(cfg: &BuildConfig) -> Result<BuildOutcome> {
     );
 
     // Step 1: validate inputs.
-    anyhow::ensure!(cfg.js_path.exists(),
-        "JS source {} does not exist", cfg.js_path.display());
-    anyhow::ensure!(cfg.worker_wasm.exists(),
+    anyhow::ensure!(
+        cfg.js_path.exists(),
+        "JS source {} does not exist",
+        cfg.js_path.display()
+    );
+    anyhow::ensure!(
+        cfg.worker_wasm.exists(),
         "worker WASM {} does not exist (build the helios-worker component first)",
-        cfg.worker_wasm.display());
+        cfg.worker_wasm.display()
+    );
 
     // Step 2: embed the JS source into the worker as a known section
     // so the init function can find it. We write a sibling `.helios.json`
@@ -95,9 +102,13 @@ pub fn build(cfg: &BuildConfig) -> Result<BuildOutcome> {
     std::fs::write(
         &init_payload,
         serde_json::to_vec_pretty(&InitPayload {
-            module_url: format!("file:///{}", cfg.js_path.file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "app.js".into())),
+            module_url: format!(
+                "file:///{}",
+                cfg.js_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "app.js".into())
+            ),
             source: src,
         })?,
     )?;
@@ -122,7 +133,10 @@ pub fn build(cfg: &BuildConfig) -> Result<BuildOutcome> {
     let size = std::fs::metadata(&cfg.output)?.len();
     tracing::info!(out = %cfg.output.display(), size_bytes = size,
         "helios build: complete");
-    Ok(BuildOutcome { output: cfg.output.clone(), bytes: size })
+    Ok(BuildOutcome {
+        output: cfg.output.clone(),
+        bytes: size,
+    })
 }
 
 /// Result of a successful build.
@@ -169,18 +183,22 @@ fn run_wizer(cfg: &BuildConfig, init_payload: &Path, out: &Path) -> Result<()> {
     // Subprocess path: shells out to a `wizer` binary on $PATH.
     let mut cmd = Command::new("wizer");
     cmd.arg("--allow-wasi")
-        .arg("--wasm-bulk-memory").arg("true")
-        .arg("--init-func").arg(&cfg.init_func)
-        .arg("--dir").arg(init_payload.parent().unwrap())
-        .arg("-o").arg(out)
+        .arg("--wasm-bulk-memory")
+        .arg("true")
+        .arg("--init-func")
+        .arg(&cfg.init_func)
+        .arg("--dir")
+        .arg(init_payload.parent().unwrap())
+        .arg("-o")
+        .arg(out)
         .arg(&cfg.worker_wasm);
 
     tracing::debug!(?cmd, "invoking wizer");
-    let status = cmd.status()
-        .context("failed to spawn `wizer`; install with `cargo install wizer-cli` \
-                  or build with the `wizer-lib` feature")?;
-    anyhow::ensure!(status.success(),
-        "wizer exited with status {}", status);
+    let status = cmd.status().context(
+        "failed to spawn `wizer`; install with `cargo install wizer-cli` \
+                  or build with the `wizer-lib` feature",
+    )?;
+    anyhow::ensure!(status.success(), "wizer exited with status {}", status);
     Ok(())
 }
 
@@ -195,8 +213,7 @@ fn run_wizer(cfg: &BuildConfig, init_payload: &Path, out: &Path) -> Result<()> {
     w.init_func(&cfg.init_func);
     w.dir(init_payload.parent().unwrap());
     let snapshot = w.run(&wasm).context("wizer run")?;
-    std::fs::write(out, snapshot)
-        .with_context(|| format!("write {}", out.display()))?;
+    std::fs::write(out, snapshot).with_context(|| format!("write {}", out.display()))?;
     Ok(())
 }
 
@@ -209,7 +226,8 @@ fn run_wasm_opt(input: &Path, output: &Path) -> Result<()> {
         .arg("-O3")
         .arg("--enable-bulk-memory")
         .arg(input)
-        .arg("-o").arg(output)
+        .arg("-o")
+        .arg(output)
         .status()
         .context("spawn `wasm-opt`")?;
     anyhow::ensure!(status.success(), "wasm-opt exited with status {}", status);

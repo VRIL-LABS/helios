@@ -19,12 +19,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use boa_engine::object::builtins::{JsPromise, JsUint8Array};
+use boa_engine::property::PropertyKey;
 use boa_engine::{
     js_string, Context, JsArgs, JsNativeError, JsObject, JsResult, JsString, JsValue,
     NativeFunction, Source,
 };
-use boa_engine::object::builtins::{JsPromise, JsUint8Array};
-use boa_engine::property::PropertyKey;
 use bytes::Bytes;
 use dashmap::DashMap;
 
@@ -142,20 +142,19 @@ impl BoaEngine {
     /// Install minimal Workers API: `addEventListener` and the `Response` constructor.
     fn install_workers_api(context: &mut Context) -> JsResult<()> {
         // addEventListener('fetch', handler) — stores handler in a global
-        let add_event_listener =
-            NativeFunction::from_copy_closure(move |_this, args, ctx| {
-                let event_type = args.get_or_undefined(0).to_string(ctx)?;
-                if event_type.to_std_string_escaped() == "fetch" {
-                    let handler = args.get_or_undefined(1).clone();
-                    ctx.global_object().set(
-                        js_string!("__helios_fetch_handler"),
-                        handler,
-                        false,
-                        ctx,
-                    )?;
-                }
-                Ok(JsValue::undefined())
-            });
+        let add_event_listener = NativeFunction::from_copy_closure(move |_this, args, ctx| {
+            let event_type = args.get_or_undefined(0).to_string(ctx)?;
+            if event_type.to_std_string_escaped() == "fetch" {
+                let handler = args.get_or_undefined(1).clone();
+                ctx.global_object().set(
+                    js_string!("__helios_fetch_handler"),
+                    handler,
+                    false,
+                    ctx,
+                )?;
+            }
+            Ok(JsValue::undefined())
+        });
 
         context.global_object().set(
             js_string!("addEventListener"),
@@ -167,14 +166,13 @@ impl BoaEngine {
         // __helios_respond_with: a permanent native function that stores the response
         // in the thread-local RESPONSE_SLOT.  Installed once per Context, avoiding
         // per-request closure allocation entirely.
-        let respond_with_fn =
-            NativeFunction::from_copy_closure(|_this, args, _ctx| {
-                let resp_val = args.get_or_undefined(0).clone();
-                RESPONSE_SLOT.with(|slot| {
-                    *slot.borrow_mut() = Some(resp_val);
-                });
-                Ok(JsValue::undefined())
+        let respond_with_fn = NativeFunction::from_copy_closure(|_this, args, _ctx| {
+            let resp_val = args.get_or_undefined(0).clone();
+            RESPONSE_SLOT.with(|slot| {
+                *slot.borrow_mut() = Some(resp_val);
             });
+            Ok(JsValue::undefined())
+        });
 
         context.global_object().set(
             js_string!("__helios_respond_with"),
@@ -185,8 +183,9 @@ impl BoaEngine {
 
         // Response constructor: new Response(body, init?)
         // Defined via eval so it acts as a true constructor that works with `instanceof`.
-        context.eval(Source::from_bytes(
-            br#"
+        context
+            .eval(Source::from_bytes(
+                br#"
             function Response(body, init) {
                 if (!(this instanceof Response)) {
                     return new Response(body, init);
@@ -205,10 +204,10 @@ impl BoaEngine {
                 }
             }
             "#,
-        ))
-        .map_err(|e| {
-            JsNativeError::typ().with_message(format!("failed to define Response: {e}"))
-        })?;
+            ))
+            .map_err(|e| {
+                JsNativeError::typ().with_message(format!("failed to define Response: {e}"))
+            })?;
 
         Ok(())
     }
@@ -234,7 +233,12 @@ impl BoaEngine {
 
         // Only create headers object if there are headers to set.
         if headers.is_empty() {
-            request.set(js_string!("headers"), JsValue::from(JsObject::with_null_proto()), false, context)?;
+            request.set(
+                js_string!("headers"),
+                JsValue::from(JsObject::with_null_proto()),
+                false,
+                context,
+            )?;
         } else {
             let headers_obj = JsObject::with_null_proto();
             for (k, v) in headers {
@@ -245,7 +249,12 @@ impl BoaEngine {
                     context,
                 )?;
             }
-            request.set(js_string!("headers"), JsValue::from(headers_obj), false, context)?;
+            request.set(
+                js_string!("headers"),
+                JsValue::from(headers_obj),
+                false,
+                context,
+            )?;
         }
 
         // Expose body as a Uint8Array so binary payloads are preserved faithfully.
@@ -253,28 +262,27 @@ impl BoaEngine {
         if body.is_empty() {
             request.set(js_string!("body"), JsValue::null(), false, context)?;
         } else {
-            let body_array = JsUint8Array::from_iter(body.iter().copied(), context)
-                .map_err(|e| {
+            let body_array =
+                JsUint8Array::from_iter(body.iter().copied(), context).map_err(|e| {
                     JsNativeError::typ()
                         .with_message(format!("failed to create body Uint8Array: {e}"))
                 })?;
             request.set(js_string!("body"), body_array, false, context)?;
         }
 
-        event.set(js_string!("request"), JsValue::from(request), false, context)?;
-
-        // respondWith: reference the pre-installed __helios_respond_with native
-        // function from the context global.  No per-request allocation needed.
-        let respond_with_val = context.global_object().get(
-            js_string!("__helios_respond_with"),
-            context,
-        )?;
         event.set(
-            js_string!("respondWith"),
-            respond_with_val,
+            js_string!("request"),
+            JsValue::from(request),
             false,
             context,
         )?;
+
+        // respondWith: reference the pre-installed __helios_respond_with native
+        // function from the context global.  No per-request allocation needed.
+        let respond_with_val = context
+            .global_object()
+            .get(js_string!("__helios_respond_with"), context)?;
+        event.set(js_string!("respondWith"), respond_with_val, false, context)?;
 
         Ok(event)
     }
@@ -282,12 +290,13 @@ impl BoaEngine {
     /// Extract the response from the thread-local `RESPONSE_SLOT` after the fetch
     /// handler has run.  Handles Promise values by driving the job queue.
     fn extract_response(context: &mut Context) -> Result<CapturedResponse, JsError> {
-        let resp_val = RESPONSE_SLOT.with(|slot| slot.borrow_mut().take())
+        let resp_val = RESPONSE_SLOT
+            .with(|slot| slot.borrow_mut().take())
             .ok_or_else(|| JsError::msg("fetch handler did not call event.respondWith()"))?;
 
-        let resp_obj = resp_val.as_object().ok_or_else(|| {
-            JsError::msg("respondWith expects a Response object")
-        })?;
+        let resp_obj = resp_val
+            .as_object()
+            .ok_or_else(|| JsError::msg("respondWith expects a Response object"))?;
 
         // Detect Promise values: if the argument is a Promise, drive the
         // microtask queue until it settles, then extract the resolved value.
@@ -298,24 +307,25 @@ impl BoaEngine {
                     JsError::msg(format!("error running jobs for async handler: {e}"))
                 })?;
                 match promise.state() {
-                    boa_engine::builtins::promise::PromiseState::Fulfilled(val) => {
-                        val.as_object().ok_or_else(|| {
+                    boa_engine::builtins::promise::PromiseState::Fulfilled(val) => val
+                        .as_object()
+                        .ok_or_else(|| {
                             JsError::msg("async fetch handler resolved with a non-object value")
-                        })?.clone()
-                    }
+                        })?
+                        .clone(),
                     boa_engine::builtins::promise::PromiseState::Rejected(val) => {
                         return Err(JsError::msg(format!(
                             "async fetch handler rejected: {}",
-                        val.display()
-                    )));
-                }
-                boa_engine::builtins::promise::PromiseState::Pending => {
-                    return Err(JsError::msg(
-                        "async fetch handler returned a Promise that did not settle \
+                            val.display()
+                        )));
+                    }
+                    boa_engine::builtins::promise::PromiseState::Pending => {
+                        return Err(JsError::msg(
+                            "async fetch handler returned a Promise that did not settle \
                          synchronously; await-based async handlers are not yet supported",
-                    ));
+                        ));
+                    }
                 }
-            }
             }
             Err(_) => resp_obj.clone(),
         };
@@ -326,7 +336,8 @@ impl BoaEngine {
             .and_then(|v| v.to_number(context).ok())
             .unwrap_or(200.0) as u16;
 
-        let body = resp_obj.get(js_string!("body"), context)
+        let body = resp_obj
+            .get(js_string!("body"), context)
             .map_err(|e| JsError::msg(format!("failed to get response body: {e}")))?;
         let body_str = if body.is_undefined() || body.is_null() {
             String::new()
@@ -337,21 +348,25 @@ impl BoaEngine {
         };
 
         let mut headers = Vec::new();
-        let headers_val = resp_obj.get(js_string!("headers"), context)
+        let headers_val = resp_obj
+            .get(js_string!("headers"), context)
             .map_err(|e| JsError::msg(format!("failed to get response headers: {e}")))?;
         if let Some(h_obj) = headers_val.as_object() {
             // Only collect string-keyed properties; symbol and index keys are
             // not valid HTTP header names and are skipped.
-            let keys = h_obj.own_property_keys(context)
+            let keys = h_obj
+                .own_property_keys(context)
                 .map_err(|e| JsError::msg(format!("failed to enumerate headers: {e}")))?;
             for key in keys {
                 let k_str = match &key {
                     PropertyKey::String(s) => s.to_std_string_escaped(),
                     _ => continue,
                 };
-                let v = h_obj.get(key, context)
+                let v = h_obj
+                    .get(key, context)
                     .map_err(|e| JsError::msg(format!("failed to get header value: {e}")))?;
-                let v_str = v.to_string(context)
+                let v_str = v
+                    .to_string(context)
                     .map_err(|e| JsError::msg(format!("failed to convert header value: {e}")))?
                     .to_std_string_escaped();
                 headers.push((k_str, v_str));
@@ -369,8 +384,7 @@ impl BoaEngine {
     /// `decode_response_capnp` in http3.rs.
     fn encode_response(resp: &CapturedResponse) -> Bytes {
         use bytes::BufMut;
-        let mut buf =
-            bytes::BytesMut::with_capacity(6 + resp.headers.len() * 64 + resp.body.len());
+        let mut buf = bytes::BytesMut::with_capacity(6 + resp.headers.len() * 64 + resp.body.len());
         // status: u16 LE
         buf.put_u16_le(resp.status);
         // header count: u32 LE
@@ -390,7 +404,9 @@ impl BoaEngine {
     }
 
     /// Parse request bytes from the capnp-encoded format used by the dispatcher.
-    fn decode_request(req_bytes: &[u8]) -> Option<(String, String, Vec<(String, String)>, Vec<u8>)> {
+    fn decode_request(
+        req_bytes: &[u8],
+    ) -> Option<(String, String, Vec<(String, String)>, Vec<u8>)> {
         let mut p = 0usize;
 
         let method = read_str(req_bytes, &mut p)?;
@@ -425,15 +441,18 @@ impl BoaEngine {
         let handler_fn = handler.as_object()?;
 
         // First probe: GET /
-        let resp1 = Self::invoke_handler_for_probe(context, &handler_fn, "GET", "http://localhost/")?;
+        let resp1 =
+            Self::invoke_handler_for_probe(context, &handler_fn, "GET", "http://localhost/")?;
         // Second probe: POST /other
-        let resp2 = Self::invoke_handler_for_probe(context, &handler_fn, "POST", "http://localhost/other")?;
+        let resp2 =
+            Self::invoke_handler_for_probe(context, &handler_fn, "POST", "http://localhost/other")?;
 
         // Only cache if both responses are identical 200s with same body and
         // the handler did not set any custom headers.  Custom headers cannot be
         // represented by the precomputed raw-TCP fast path, so we skip caching
         // when they are present to avoid silently dropping them.
-        if resp1.status == 200 && resp2.status == 200
+        if resp1.status == 200
+            && resp2.status == 200
             && resp1.body == resp2.body
             && resp1.headers == resp2.headers
             && resp1.headers.is_empty()
@@ -533,16 +552,10 @@ impl JsEngineBackend for BoaEngine {
         self.eval_module(src, module_url)
     }
 
-    fn call_fetch_handler(
-        &self,
-        handle: ModuleHandle,
-        req_bytes: Bytes,
-    ) -> Result<Bytes, JsError> {
+    fn call_fetch_handler(&self, handle: ModuleHandle, req_bytes: Bytes) -> Result<Bytes, JsError> {
         let handle_id = handle.0;
-        let (method, url, headers, body) =
-            Self::decode_request(&req_bytes).unwrap_or_else(|| {
-                ("GET".to_string(), "/".to_string(), vec![], vec![])
-            });
+        let (method, url, headers, body) = Self::decode_request(&req_bytes)
+            .unwrap_or_else(|| ("GET".to_string(), "/".to_string(), vec![], vec![]));
 
         let engine_id = self.engine_id;
 
@@ -574,7 +587,9 @@ impl JsEngineBackend for BoaEngine {
             // requests, avoiding a full parse+eval cycle on every call.
             if !cache.contains_key(&key) {
                 let (source, gen) = {
-                    let module = self.modules.get(&handle_id)
+                    let module = self
+                        .modules
+                        .get(&handle_id)
                         .ok_or_else(|| JsError::msg(format!("unknown handle {}", handle_id)))?;
                     (module.source.clone(), module.generation)
                 };
@@ -600,11 +615,19 @@ impl JsEngineBackend for BoaEngine {
                     ));
                 }
 
-                let fetch_handler = handler.as_object().ok_or_else(|| {
-                    JsError::msg("fetch handler is not an object")
-                })?.clone();
+                let fetch_handler = handler
+                    .as_object()
+                    .ok_or_else(|| JsError::msg("fetch handler is not an object"))?
+                    .clone();
 
-                cache.insert(key, WorkerContext { context, generation: gen, fetch_handler });
+                cache.insert(
+                    key,
+                    WorkerContext {
+                        context,
+                        generation: gen,
+                        fetch_handler,
+                    },
+                );
             }
 
             let wctx = cache.get_mut(&key).unwrap();
@@ -614,14 +637,8 @@ impl JsEngineBackend for BoaEngine {
 
             // Build a fresh event object for this request.  Creating new JsObjects is
             // cheap compared to re-parsing the script; the GC reclaims them after the call.
-            let event = Self::create_fetch_event(
-                &mut wctx.context,
-                &method,
-                &url,
-                &headers,
-                &body,
-            )
-            .map_err(|e| JsError::msg(format!("failed to create fetch event: {e}")))?;
+            let event = Self::create_fetch_event(&mut wctx.context, &method, &url, &headers, &body)
+                .map_err(|e| JsError::msg(format!("failed to create fetch event: {e}")))?;
 
             handler_fn
                 .call(&JsValue::undefined(), &[event.into()], &mut wctx.context)
@@ -711,12 +728,7 @@ mod tests {
         assert_eq!(resp.2, b"Not Found");
     }
 
-    fn build_test_request(
-        method: &str,
-        url: &str,
-        headers: &[(&str, &str)],
-        body: &[u8],
-    ) -> Bytes {
+    fn build_test_request(method: &str, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Bytes {
         use bytes::BufMut;
         let mut buf = bytes::BytesMut::with_capacity(256);
         // method

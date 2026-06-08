@@ -7,7 +7,7 @@
 
 Helios is a Rust-based HTTP server and toolchain for running Workers-style JavaScript handlers at the edge. It provides multi-protocol HTTP serving (HTTP/1.1, HTTP/2, and HTTP/3), a built-in load-testing tool, and a Wizer-based WASM snapshot pipeline.
 
-> **Status: v1.1.0-beta.** The current release ships the full server, dispatch, and benchmarking infrastructure with JavaScript execution powered by the Boa ECMAScript engine. Full SpiderMonkey JIT integration is in active development for maximum performance.
+> **Status: v1.1.1-beta.** Production engine backed by native SpiderMonkey through the `mozjs` crate. SpiderMonkey's own `jit` crate feature is enabled by default, so hot fetch handlers can tier up in the native runtime instead of executing inside a Wasm sandbox without executable pages.
 
 ## Quick start
 

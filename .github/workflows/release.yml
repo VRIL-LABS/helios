@@ -1,0 +1,178 @@
+name: Create GitHub release
+
+# Builds the `helios` CLI binary and publishes a GitHub release for it.
+# Triggered manually so a maintainer can pick the version tag, mark it as a
+# prerelease (e.g. `-rc`/`-alpha` builds), and provide a title. The release
+# description is generated automatically from merged PRs/commits since the
+# previous release, so it stays accurate without manual bookkeeping.
+#
+# Docs referenced:
+# - https://docs.github.com/en/rest/releases/releases#generate-release-notes-content-for-a-release
+# - https://cli.github.com/manual/gh_release_create
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to release (e.g. v1.2.0-rc1)'
+        required: true
+        type: string
+      title:
+        description: 'Release title (e.g. "Helios v1.2.0-rc1 ☀️"). Defaults to "Helios <tag> ☀️" when left blank.'
+        required: false
+        type: string
+      prerelease:
+        description: 'Mark this release as a prerelease'
+        required: true
+        type: boolean
+        default: true
+      target_commitish:
+        description: 'Branch or commit SHA to tag (defaults to the current branch/commit)'
+        required: false
+        type: string
+
+permissions:
+  # Needed to create the tag, the release, and upload the release asset.
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "Tag '$TAG' does not look like a valid version (expected e.g. v1.2.0 or v1.2.0-rc1)." >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_commitish || github.sha }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rs/target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rs/Cargo.lock') }}
+
+      - name: Build release binary
+        working-directory: rs
+        run: cargo build --release --locked -p helios
+
+      - name: Package release archive
+        id: package
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          PKG_NAME="helios-${TAG}-x86_64-unknown-linux-gnu"
+          STAGE_DIR="dist/${PKG_NAME}"
+          mkdir -p "${STAGE_DIR}/bin"
+          cp rs/target/release/helios "${STAGE_DIR}/bin/helios"
+          cp -r rs "${STAGE_DIR}/rs"
+          rm -rf "${STAGE_DIR}/rs/target"
+          cp -r bench "${STAGE_DIR}/bench"
+          mkdir -p "${STAGE_DIR}/assets"
+          cp assets/helios-header.svg "${STAGE_DIR}/assets/helios-header.svg"
+          cp README.md "${STAGE_DIR}/README.md"
+          cp LICENSE "${STAGE_DIR}/LICENSE"
+          cat > "${STAGE_DIR}/PACKAGE.md" <<EOF
+          # Helios public package
+
+          Version: ${TAG}
+          Target: x86_64-unknown-linux-gnu
+
+          Contents:
+
+          - \`bin/helios\` — optimized Linux Helios CLI binary.
+          - \`rs/\` — Rust workspace source (helios crate) for crates.io publishing.
+          - \`bench/\` — benchmark fixtures for local smoke tests.
+          - \`assets/helios-header.svg\` — project header graphic.
+          - \`README.md\` — project README.
+          - \`LICENSE\` — MIT license.
+          EOF
+          tar -C dist -czf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+          echo "archive=${PKG_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=${PKG_NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Determine previous release tag
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREVIOUS_TAG=$(gh release list --repo "${{ github.repository }}" \
+            --exclude-drafts --exclude-pre-releases=false \
+            --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+          echo "tag=${PREVIOUS_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET: ${{ inputs.target_commitish || github.sha }}
+          PREVIOUS_TAG: ${{ steps.previous.outputs.tag }}
+        run: |
+          if [ -n "$PREVIOUS_TAG" ]; then
+            gh api "repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="$TAG" -f target_commitish="$TARGET" -f previous_tag_name="$PREVIOUS_TAG" \
+              --jq .body > body.md
+          else
+            gh api "repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="$TAG" -f target_commitish="$TARGET" \
+              --jq .body > body.md
+          fi
+          {
+            echo "## helios-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+            echo
+            echo '```'
+            cat "${{ steps.package.outputs.checksum }}"
+            echo '```'
+            echo
+            cat body.md
+          } > notes.md
+
+      - name: Determine release title
+        id: title
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          TITLE="${{ inputs.title }}"
+          if [ -z "$TITLE" ]; then
+            TITLE="Helios ${TAG} ☀️"
+          fi
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TITLE: ${{ steps.title.outputs.title }}
+          TARGET: ${{ inputs.target_commitish || github.sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          PRERELEASE_FLAG=()
+          if [ "$PRERELEASE" = "true" ]; then
+            PRERELEASE_FLAG=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ steps.package.outputs.checksum }}" \
+            --repo "${{ github.repository }}" \
+            --title "$TITLE" \
+            --notes-file notes.md \
+            --target "$TARGET" \
+            "${PRERELEASE_FLAG[@]}"

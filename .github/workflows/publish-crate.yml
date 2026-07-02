@@ -60,8 +60,17 @@ jobs:
         # "helios" to "vrillabs-helios". Patch it in-place so all cargo commands
         # below can use the canonical crates.io name unconditionally. This change
         # is ephemeral and is never committed or pushed.
+        #
+        # The substitution is intentionally scoped to the [package] section via a
+        # sed address range (/^\[package\]/,/^\[/). This prevents the pattern from
+        # also matching the `name` field under [lib], which must remain "helios"
+        # (an unqualified Rust identifier). Per the official Cargo reference:
+        # https://doc.rust-lang.org/cargo/reference/cargo-targets.html
+        # "library target names cannot contain hyphens" — Cargo rejects any [lib]
+        # name that is not a valid Rust identifier, so "vrillabs-helios" is illegal
+        # there even though it is a valid [package] name on crates.io.
         run: |
-          sed -i 's/^name = "helios"$/name = "vrillabs-helios"/' rs/helios/Cargo.toml
+          sed -i '/^\[package\]/,/^\[/{s/^name = "helios"$/name = "vrillabs-helios"/}' rs/helios/Cargo.toml
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

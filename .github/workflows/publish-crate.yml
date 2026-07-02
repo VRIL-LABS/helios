@@ -20,6 +20,8 @@ on:
         type: string
 
 permissions:
+  # Only read access is needed: the version bump made by cargo-set-version is
+  # ephemeral and is never committed or pushed back to the repository.
   contents: read
 
 jobs:
@@ -55,13 +57,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-set-version
-          key: ${{ runner.os }}-cargo-edit-bin
+          key: ${{ runner.os }}-cargo-edit-bin-v0.13.2
 
       - name: Set crate version from release tag
         working-directory: rs
         run: |
           if ! command -v cargo-set-version >/dev/null 2>&1; then
-            cargo install cargo-edit --locked
+            cargo install cargo-edit --locked --version 0.13.2
           fi
           cargo set-version -p helios "${{ steps.tag.outputs.version }}"
 

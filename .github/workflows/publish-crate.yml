@@ -55,6 +55,14 @@ jobs:
         with:
           ref: ${{ steps.tag.outputs.tag }}
 
+      - name: Normalize crate package name
+        # Old release tags were cut before rs/helios/Cargo.toml was renamed from
+        # "helios" to "vrillabs-helios". Patch it in-place so all cargo commands
+        # below can use the canonical crates.io name unconditionally. This change
+        # is ephemeral and is never committed or pushed.
+        run: |
+          sed -i 's/^name = "helios"$/name = "vrillabs-helios"/' rs/helios/Cargo.toml
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

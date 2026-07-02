@@ -71,6 +71,6 @@ Helios is benchmarked with its own built-in `helios bench` load generator agains
 
 ## License
 
-Helios is licensed under the MIT License. See [`LICENSE`](LICENSE).
+Helios is licensed under the VRIL LABS Open Source License. See [`LICENSE`](LICENSE) or [vril.li/license](https://vril.li/license).
 
 *"WinterJS promised the sun. Helios delivers it."*

@@ -31,13 +31,18 @@ jobs:
     steps:
       - name: Determine release tag
         id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.event.release.tag_name }}"
           if [ -z "$TAG" ]; then
             TAG="${{ inputs.tag }}"
           fi
           if [ -z "$TAG" ]; then
-            echo "No release tag available (neither release event nor workflow_dispatch input)." >&2
+            TAG=$(gh release view --repo "${{ github.repository }}" --template '{{.tagName}}')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "No release tag available (neither release event, workflow_dispatch input, nor latest release)." >&2
             exit 1
           fi
           # crates.io versions must be valid SemVer without a leading "v".
@@ -66,11 +71,21 @@ jobs:
             cargo install cargo-edit --locked --version 0.13.2
           fi
           cargo set-version -p helios "${{ steps.tag.outputs.version }}"
+          # Regenerate the lockfile so it matches the bumped manifest version;
+          # otherwise `cargo publish --locked` would fail with a stale lock file.
+          cargo update -p helios
 
       - name: Verify crate version
         working-directory: rs
         run: |
-          PUBLISHED_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "helios") | .version')
+          PUBLISHED_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          package = next((p for p in data['packages'] if p['name'] == 'helios'), None)
+          if package is None:
+              sys.exit('helios package not found in cargo metadata output')
+          print(package['version'])
+          ")
           if [ "$PUBLISHED_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
             echo "Cargo.toml version ($PUBLISHED_VERSION) does not match release tag version (${{ steps.tag.outputs.version }})." >&2
             exit 1

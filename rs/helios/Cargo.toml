@@ -1,5 +1,5 @@
 [package]
-name = "helios"
+name = "vrillabs-helios"
 version = "0.1.0"
 description = "HELIOS: a JIT-at-the-edge JavaScript runtime. JIT at the edge. Finally."
 edition.workspace = true

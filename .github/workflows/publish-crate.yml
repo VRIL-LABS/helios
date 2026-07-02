@@ -73,7 +73,7 @@ jobs:
           cargo set-version -p vrillabs-helios "${{ steps.tag.outputs.version }}"
           # Regenerate the lockfile so it matches the bumped manifest version;
           # otherwise `cargo publish --locked` would fail with a stale lock file.
-          cargo update -p helios
+          cargo update -p vrillabs-helios
 
       - name: Verify crate version
         working-directory: rs

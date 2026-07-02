@@ -64,26 +64,53 @@ jobs:
           path: ~/.cargo/bin/cargo-set-version
           key: ${{ runner.os }}-cargo-edit-bin-v0.13.2
 
+      - name: Resolve crate package name
+        id: pkg
+        working-directory: rs
+        run: |
+          PKG_NAME=$(cargo metadata --no-deps --format-version 1 \
+            --manifest-path helios/Cargo.toml | python3 -c "
+          import json, sys, os
+          data = json.load(sys.stdin)
+          target = os.path.abspath('helios/Cargo.toml')
+          pkg = next(
+            (p for p in data['packages'] if os.path.abspath(p['manifest_path']) == target),
+            None,
+          )
+          if pkg is None:
+            sys.exit('Could not find package with manifest ' + target)
+          print(pkg['name'])
+          ")
+          if [ -z "$PKG_NAME" ]; then
+            echo "Could not resolve package name from rs/helios/Cargo.toml" >&2
+            exit 1
+          fi
+          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+
       - name: Set crate version from release tag
         working-directory: rs
         run: |
           if ! command -v cargo-set-version >/dev/null 2>&1; then
             cargo install cargo-edit --locked --version 0.13.2
           fi
-          cargo set-version -p vrillabs-helios "${{ steps.tag.outputs.version }}"
+          cargo set-version -p "${{ steps.pkg.outputs.name }}" "${{ steps.tag.outputs.version }}"
           # Regenerate the lockfile so it matches the bumped manifest version;
           # otherwise `cargo publish --locked` would fail with a stale lock file.
-          cargo update -p vrillabs-helios
+          cargo update -p "${{ steps.pkg.outputs.name }}"
 
       - name: Verify crate version
         working-directory: rs
+        env:
+          PKG_NAME: ${{ steps.pkg.outputs.name }}
         run: |
-          PUBLISHED_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "
-          import json, sys
+          PUBLISHED_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            --manifest-path helios/Cargo.toml | python3 -c "
+          import json, sys, os
           data = json.load(sys.stdin)
-          package = next((p for p in data['packages'] if p['name'] == 'vrillabs-helios'), None)
+          pkg_name = os.environ['PKG_NAME']
+          package = next((p for p in data['packages'] if p['name'] == pkg_name), None)
           if package is None:
-            sys.exit('vrillabs-helios package not found in cargo metadata output')
+            sys.exit(pkg_name + ' package not found in cargo metadata output')
           print(package['version'])
           ")
           if [ "$PUBLISHED_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
@@ -95,4 +122,4 @@ jobs:
         working-directory: rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p vrillabs-helios --locked --allow-dirty
+        run: cargo publish -p "${{ steps.pkg.outputs.name }}" --locked --allow-dirty

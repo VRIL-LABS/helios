@@ -113,8 +113,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           PREVIOUS_TAG=$(gh release list --repo "${{ github.repository }}" \
-            --exclude-drafts --exclude-pre-releases=false \
-            --json tagName --jq '.[0].tagName' 2>/dev/null || true)
+            --exclude-drafts --limit 1 \
+            --json tagName --jq '.[0].tagName // ""' 2>/dev/null || true)
           echo "tag=${PREVIOUS_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes

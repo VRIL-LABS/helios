@@ -5,6 +5,11 @@
 # ☀️ Helios
 > **JIT at the edge, blazing like the sun.**
 
+[![Crates.io](https://img.shields.io/crates/v/vrillabs-helios.svg)](https://crates.io/crates/vrillabs-helios)
+[![docs.rs](https://img.shields.io/docsrs/vrillabs-helios)](https://docs.rs/vrillabs-helios/1.2.0-rc1/helios/)
+[![Crates.io downloads](https://img.shields.io/crates/d/vrillabs-helios.svg)](https://crates.io/crates/vrillabs-helios)
+[![License](https://img.shields.io/badge/license-VRIL%20LABS%20Open%20Source-blue.svg)](LICENSE)
+
 Helios is an alpha-stage JavaScript runtime written in Rust for edge and serverless-style workloads. It provides a lock-free worker dispatcher, a shared bytecode cache, Hyper-based HTTP/1.1 + HTTP/2 serving, optional QUIC/HTTP/3 and WebTransport support, and a built-in benchmark harness.
 
 The default build is self-contained: it embeds a pure-Rust Boa JavaScript engine, so it runs without any external JavaScript toolchain. An experimental SpiderMonkey/Ion backend is scaffolded behind a feature flag but is not yet production-ready.
@@ -33,6 +38,32 @@ cd rs
 cargo build --release -p helios
 ./target/release/helios serve ../bench/helios-simple.js --port 8080
 ```
+
+## Metadata
+
+Helios is published on [crates.io](https://crates.io/crates/vrillabs-helios) as `vrillabs-helios`.
+
+```sh
+cargo install vrillabs-helios
+```
+
+Running the above command will globally install the `helios` binary.
+
+### Install as library
+
+Run the following Cargo command in your project directory:
+
+```sh
+cargo add vrillabs-helios
+```
+
+Or add the following line to your `Cargo.toml`:
+
+```toml
+vrillabs-helios = "1.2.0-rc1"
+```
+
+Full API documentation is available on [docs.rs](https://docs.rs/vrillabs-helios/1.2.0-rc1/helios/).
 
 ## Current capabilities
 

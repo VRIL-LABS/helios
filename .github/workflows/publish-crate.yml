@@ -95,4 +95,4 @@ jobs:
         working-directory: rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p helios --locked
+        run: cargo publish -p helios --locked --allow-dirty

@@ -10,7 +10,7 @@
 [![Crates.io downloads](https://img.shields.io/crates/d/vrillabs-helios.svg)](https://crates.io/crates/vrillabs-helios)
 [![License](https://img.shields.io/badge/license-VRIL%20LABS%20Open%20Source-blue.svg)](LICENSE)
 
-Helios is an alpha-stage JavaScript runtime written in Rust for edge and serverless-style workloads. It provides a lock-free worker dispatcher, a shared bytecode cache, Hyper-based HTTP/1.1 + HTTP/2 serving, optional QUIC/HTTP/3 and WebTransport support, and a built-in benchmark harness.
+Helios is a JavaScript runtime written in Rust for edge and serverless-style workloads. It provides a lock-free worker dispatcher, a shared bytecode cache, Hyper-based HTTP/1.1 + HTTP/2 serving, optional QUIC/HTTP/3 and WebTransport support, and a built-in benchmark harness.
 
 The default build is self-contained: it embeds a pure-Rust Boa JavaScript engine, so it runs without any external JavaScript toolchain. An experimental SpiderMonkey/Ion backend is scaffolded behind a feature flag but is not yet production-ready.
 

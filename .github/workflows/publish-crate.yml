@@ -51,10 +51,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo-edit binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-set-version
+          key: ${{ runner.os }}-cargo-edit-bin
+
       - name: Set crate version from release tag
         working-directory: rs
         run: |
-          cargo install cargo-edit --locked
+          if ! command -v cargo-set-version >/dev/null 2>&1; then
+            cargo install cargo-edit --locked
+          fi
           cargo set-version -p helios "${{ steps.tag.outputs.version }}"
 
       - name: Verify crate version

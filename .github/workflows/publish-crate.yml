@@ -70,7 +70,7 @@ jobs:
           if ! command -v cargo-set-version >/dev/null 2>&1; then
             cargo install cargo-edit --locked --version 0.13.2
           fi
-          cargo set-version -p helios "${{ steps.tag.outputs.version }}"
+          cargo set-version -p vrillabs-helios "${{ steps.tag.outputs.version }}"
           # Regenerate the lockfile so it matches the bumped manifest version;
           # otherwise `cargo publish --locked` would fail with a stale lock file.
           cargo update -p helios
@@ -81,9 +81,9 @@ jobs:
           PUBLISHED_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "
           import json, sys
           data = json.load(sys.stdin)
-          package = next((p for p in data['packages'] if p['name'] == 'helios'), None)
+          package = next((p for p in data['packages'] if p['name'] == 'vrillabs-helios'), None)
           if package is None:
-            sys.exit('helios package not found in cargo metadata output')
+            sys.exit('vrillabs-helios package not found in cargo metadata output')
           print(package['version'])
           ")
           if [ "$PUBLISHED_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
@@ -95,4 +95,4 @@ jobs:
         working-directory: rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p helios --locked --allow-dirty
+        run: cargo publish -p vrillabs-helios --locked --allow-dirty

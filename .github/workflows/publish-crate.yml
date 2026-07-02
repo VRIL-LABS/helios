@@ -1,0 +1,98 @@
+name: Publish crate to crates.io
+
+# Publishes the `helios` crate (in rs/helios) to the official Rust package
+# registry (crates.io) whenever a GitHub release is published, or on demand
+# via workflow_dispatch. The crate version is taken from the release tag
+# (e.g. `v1.2.0-rc1` / `1.2.0-rc1`), so `rs/helios/Cargo.toml` never needs to
+# be hand-edited before cutting a release.
+#
+# Docs referenced:
+# - https://doc.rust-lang.org/cargo/reference/publishing.html
+# - https://doc.rust-lang.org/cargo/reference/registry-authentication.html
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.2.0-rc1). Defaults to the latest release."
+        required: false
+        type: string
+
+permissions:
+  # Only read access is needed: the version bump made by cargo-set-version is
+  # ephemeral and is never committed or pushed back to the repository.
+  contents: read
+
+jobs:
+  publish:
+    name: Publish helios to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo "${{ github.repository }}" --template '{{.tagName}}')
+          fi
+          if [ -z "$TAG" ]; then
+            echo "No release tag available (neither release event, workflow_dispatch input, nor latest release)." >&2
+            exit 1
+          fi
+          # crates.io versions must be valid SemVer without a leading "v".
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo-edit binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-set-version
+          key: ${{ runner.os }}-cargo-edit-bin-v0.13.2
+
+      - name: Set crate version from release tag
+        working-directory: rs
+        run: |
+          if ! command -v cargo-set-version >/dev/null 2>&1; then
+            cargo install cargo-edit --locked --version 0.13.2
+          fi
+          cargo set-version -p helios "${{ steps.tag.outputs.version }}"
+          # Regenerate the lockfile so it matches the bumped manifest version;
+          # otherwise `cargo publish --locked` would fail with a stale lock file.
+          cargo update -p helios
+
+      - name: Verify crate version
+        working-directory: rs
+        run: |
+          PUBLISHED_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          package = next((p for p in data['packages'] if p['name'] == 'helios'), None)
+          if package is None:
+              sys.exit('helios package not found in cargo metadata output')
+          print(package['version'])
+          ")
+          if [ "$PUBLISHED_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "Cargo.toml version ($PUBLISHED_VERSION) does not match release tag version (${{ steps.tag.outputs.version }})." >&2
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        working-directory: rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p helios --locked

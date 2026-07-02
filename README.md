@@ -67,7 +67,7 @@ Notes:
 
 ## Performance
 
-Helios is benchmarked with its own built-in `helios bench` load generator against static and dynamic (JavaScript fetch-handler) workloads, covering worker dispatch, the bytecode cache, and the HTTP/1 response path. See the project's GitHub repository ([`VrilLabs/helios`](https://github.com/VrilLabs/helios)) for the full benchmark methodology and results.
+Helios is benchmarked with its own built-in `helios bench` load generator against static and dynamic (JavaScript fetch-handler) workloads, covering worker dispatch, the bytecode cache, and the HTTP/1 response path. 
 
 ## License
 

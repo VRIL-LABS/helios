@@ -69,7 +69,7 @@ jobs:
 
       - name: Build release binary
         working-directory: rs
-        run: cargo build --release --locked -p helios
+        run: cargo build --release --locked -p vrillabs-helios
 
       - name: Package release archive
         id: package

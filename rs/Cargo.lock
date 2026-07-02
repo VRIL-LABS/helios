@@ -1478,52 +1478,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "helios"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "boa_engine",
- "bytes",
- "capnp",
- "clap",
- "crossbeam",
- "crossbeam-queue",
- "dashmap",
- "futures",
- "h3",
- "h3-quinn",
- "hdrhistogram",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "memchr",
- "mimalloc",
- "once_cell",
- "parking_lot",
- "quinn",
- "reqwest",
- "ring",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "socket2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "wasmtime 26.0.1",
- "wasmtime-wasi 26.0.1",
- "wizer",
-]
-
-[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3511,6 +3465,52 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vrillabs-helios"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "boa_engine",
+ "bytes",
+ "capnp",
+ "clap",
+ "crossbeam",
+ "crossbeam-queue",
+ "dashmap",
+ "futures",
+ "h3",
+ "h3-quinn",
+ "hdrhistogram",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "memchr",
+ "mimalloc",
+ "once_cell",
+ "parking_lot",
+ "quinn",
+ "reqwest",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "socket2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "wasmtime 26.0.1",
+ "wasmtime-wasi 26.0.1",
+ "wizer",
+]
 
 [[package]]
 name = "want"

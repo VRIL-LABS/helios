@@ -39,7 +39,7 @@ jobs:
             TAG="${{ inputs.tag }}"
           fi
           if [ -z "$TAG" ]; then
-            TAG=$(gh release view --repo "${{ github.repository }}" --template '{{.tagName}}')
+            TAG=$(gh release view --repo "${{ github.repository }}" --json tagName --template '{{.tagName}}')
           fi
           if [ -z "$TAG" ]; then
             echo "No release tag available (neither release event, workflow_dispatch input, nor latest release)." >&2

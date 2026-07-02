@@ -60,23 +60,8 @@
     </filter>
 
     <linearGradient id="badgeFill" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#ffc840" stop-opacity=".54"/>
-      <stop offset="100%" stop-color="#c95800" stop-opacity=".42"/>
-    </linearGradient>
-
-    <radialGradient id="achieveBadge" cx="35%" cy="30%" r="70%">
-      <stop offset="0%" stop-color="#ffe566" stop-opacity=".97"/>
-      <stop offset="55%" stop-color="#ff9100" stop-opacity=".93"/>
-      <stop offset="100%" stop-color="#c94800" stop-opacity=".88"/>
-    </radialGradient>
-
-    <filter id="achieveGlow" x="-30%" y="-30%" width="160%" height="160%">
-      <feDropShadow dx="0" dy="0" stdDeviation="9" flood-color="#ffaa00" flood-opacity=".82"/>
-    </filter>
-
-    <linearGradient id="starTrail" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%"   stop-color="#fffde0" stop-opacity=".95"/>
-      <stop offset="100%" stop-color="#fffde0" stop-opacity="0"/>
+      <stop offset="0%" stop-color="#ffc840" stop-opacity=".28"/>
+      <stop offset="100%" stop-color="#ff8000" stop-opacity=".16"/>
     </linearGradient>
 
     <clipPath id="windowClip">
@@ -93,7 +78,7 @@
 
     <style>
       @media (prefers-reduced-motion: reduce) {
-        .ray, .spark, .orb, .shine, .sstar, .ufo-anim { animation: none !important; }
+        .ray, .spark, .orb, .shine { animation: none !important; }
       }
 
       .ray {
@@ -149,33 +134,6 @@
         0%, 100% { transform: translateX(-150px) rotate(-9deg); opacity: .08; }
         46%, 58% { transform: translateX(150px) rotate(-9deg); opacity: .42; }
       }
-
-      .sstar, .ufo-anim {
-        opacity: 0;
-      }
-
-      @keyframes shootStar {
-        0%   { transform: translateX(0);      opacity: 0; }
-        4%   { opacity: .88; }
-        16%  { transform: translateX(-420px); opacity: 0; }
-        100% { transform: translateX(-420px); opacity: 0; }
-      }
-
-      @keyframes ufoFly {
-        0%, 2.9% { transform: translateX(1380px); opacity: 0; }
-        3%        { transform: translateX(1260px); opacity: 1; }
-        7%        { transform: translateX(150px);  opacity: .88; }
-        7.8%      { transform: translateX(144px);  opacity: 0; }
-        100%      { transform: translateX(144px);  opacity: 0; }
-      }
-
-      @keyframes portalOpen {
-        0%, 7.5%  { transform: scale(0);   opacity: 0; }
-        8.2%      { transform: scale(1);   opacity: .76; }
-        9%        { transform: scale(1.6); opacity: .38; }
-        10%       { transform: scale(2.5); opacity: 0; }
-        100%      { transform: scale(2.5); opacity: 0; }
-      }
     </style>
   </defs>
 
@@ -183,63 +141,10 @@
   <path d="M0 332C151 267 244 291 365 330c150 49 244-23 376-54 174-41 274 65 420 60 102-3 169-44 239-92v196H0Z" fill="#150d2d" opacity=".42"/>
   <path d="M0 359c177-68 314-29 459-6 174 28 294-69 452-61 181 9 252 91 489 17v131H0Z" fill="#09051a" opacity=".52"/>
 
-  <!-- Shooting stars — rendered behind sun, rays, and window -->
-  <g id="shootingStars">
-    <g transform="translate(1080,28) rotate(-35)">
-      <rect class="sstar" x="0" y="-1.2" width="160" height="2.4" rx="1.2"
-            fill="url(#starTrail)"
-            style="animation:shootStar 24s ease-in -1s infinite;"/>
-    </g>
-    <g transform="translate(780,15) rotate(-32)">
-      <rect class="sstar" x="0" y="-1" width="130" height="2" rx="1"
-            fill="url(#starTrail)"
-            style="animation:shootStar 31s ease-in -9s infinite;"/>
-    </g>
-    <g transform="translate(1260,55) rotate(-38)">
-      <rect class="sstar" x="0" y="-1.3" width="180" height="2.6" rx="1.3"
-            fill="url(#starTrail)"
-            style="animation:shootStar 19s ease-in -5s infinite;"/>
-    </g>
-    <g transform="translate(580,8) rotate(-30)">
-      <rect class="sstar" x="0" y="-1" width="120" height="2" rx="1"
-            fill="url(#starTrail)"
-            style="animation:shootStar 27s ease-in -18s infinite;"/>
-    </g>
-    <g transform="translate(950,70) rotate(-36)">
-      <rect class="sstar" x="0" y="-1.1" width="145" height="2.2" rx="1.1"
-            fill="url(#starTrail)"
-            style="animation:shootStar 22s ease-in -13s infinite;"/>
-    </g>
-  </g>
-
-  <!-- Flying saucer — rare warp event in sky (~1× per 65 s), behind all foreground -->
-  <g id="ufoScene" transform="translate(0,48)">
-    <!-- Saucer + contrails (translate across sky right→left) -->
-    <g class="ufo-anim" style="animation:ufoFly 65s ease-in 0s infinite;">
-      <!-- Contrails trailing to the right as saucer moves left -->
-      <rect x="18" y="-1"   width="280" height="2"   rx="1"   fill="url(#starTrail)" opacity=".58"/>
-      <rect x="18" y="3.5"  width="200" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".32"/>
-      <rect x="18" y="-4.5" width="155" height="1.2" rx=".6"  fill="url(#starTrail)" opacity=".26"/>
-      <!-- Saucer body -->
-      <ellipse cx="0" cy="0"  rx="22" ry="7"  fill="#fffde0" opacity=".84"/>
-      <!-- Dome -->
-      <ellipse cx="0" cy="-6" rx="10" ry="5"  fill="#fffde0" opacity=".68"/>
-      <!-- Window -->
-      <circle  cx="0" cy="-6" r="2.5"          fill="#fffde0" opacity=".42"/>
-      <!-- Belly glow stripe -->
-      <rect x="-18" y="5" width="36" height="1.5" rx=".75"   fill="#fffde0" opacity=".36"/>
-    </g>
-    <!-- Portal ring — expands at saucer exit point (x=150) -->
-    <g transform="translate(150,0)">
-      <circle cx="0" cy="0" r="20" fill="none" stroke="#fffde0" stroke-width="1.6"
-              class="ufo-anim"
-              style="animation:portalOpen 65s ease-out 0s infinite;
-                     transform-box:fill-box; transform-origin:center;"/>
-      <circle cx="0" cy="0" r="12" fill="none" stroke="#fffde0" stroke-width=".8" opacity=".55"
-              class="ufo-anim"
-              style="animation:portalOpen 65s ease-out 0s infinite;
-                     transform-box:fill-box; transform-origin:center;"/>
-    </g>
+  <g class="orb">
+    <circle cx="700" cy="226" r="250" fill="url(#sunGlow)" filter="url(#softBlur)"/>
+    <circle cx="700" cy="226" r="122" fill="#fff2a3" opacity=".94"/>
+    <circle cx="700" cy="226" r="84" fill="#fff9d7" opacity=".86"/>
   </g>
 
   <g class="ray" opacity=".5">
@@ -260,17 +165,11 @@
     <path d="M942 226 728 186 700 226 728 266Z" fill="#ffbb56"/>
   </g>
 
-  <g class="orb">
-    <circle cx="700" cy="226" r="250" fill="url(#sunGlow)" filter="url(#softBlur)"/>
-    <circle cx="700" cy="226" r="122" fill="#fff2a3" opacity=".94"/>
-    <circle cx="700" cy="226" r="84" fill="#fff9d7" opacity=".86"/>
-  </g>
-
   <g clip-path="url(#windowClip)" opacity=".88">
     <rect x="130" y="44" width="1140" height="352" fill="#fff" opacity=".08" filter="url(#glassBlur)"/>
     <circle cx="700" cy="226" r="220" fill="#fff6bd" opacity=".18" filter="url(#softBlur)"/>
-    <path class="shine" d="M195 0h188l-238 440H-43Z" fill="#fff" opacity=".22"/>
-    <path class="shine" d="M1064 0h82L888 440h-85Z" fill="#fff" opacity=".16" style="animation-delay:-3s"/>
+    <path class="shine" d="M195 64h188l-238 320H-43Z" fill="#fff" opacity=".22"/>
+    <path class="shine" d="M1064 42h82L888 386h-85Z" fill="#fff" opacity=".16" style="animation-delay:-3s"/>
     <rect width="1400" height="440" fill="url(#grain)" opacity=".45"/>
   </g>
 
@@ -303,73 +202,30 @@
   <!-- Sun-colored badge pills -->
   <rect x="289" y="260" width="184" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
   <text x="381" y="280" text-anchor="middle"
-        fill="#fff"
+        fill="#ffe496"
         font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
         font-size="13.5" font-weight="700" letter-spacing=".5"
         filter="url(#tagShadow)">JIT-at-the-edge</text>
 
   <rect x="487" y="260" width="202" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
   <text x="588" y="280" text-anchor="middle"
-        fill="#fff"
+        fill="#ffe496"
         font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
         font-size="13.5" font-weight="700" letter-spacing=".5"
         filter="url(#tagShadow)">JavaScript Runtime</text>
 
   <rect x="703" y="260" width="229" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
   <text x="817" y="280" text-anchor="middle"
-        fill="#fff"
+        fill="#ffe496"
         font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
         font-size="13.5" font-weight="700" letter-spacing=".5"
         filter="url(#tagShadow)">HTTP/3 · WebTransport</text>
 
   <rect x="946" y="260" width="166" height="32" rx="16" fill="url(#badgeFill)" stroke="#ffbf40" stroke-width="1.4" stroke-opacity=".92"/>
   <text x="1029" y="280" text-anchor="middle"
-        fill="#fff"
+        fill="#ffe496"
         font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
         font-size="13.5" font-weight="700" letter-spacing=".5"
         filter="url(#tagShadow)">WASM Snapshots</text>
-
-  <!-- Achievement starburst badges -->
-  <polygon points="262,101 276,120 300,117 297,141 316,155 297,170 300,193 276,190 262,209 248,190 224,193 227,170 208,155 227,141 224,117 248,120"
-           fill="url(#achieveBadge)" stroke="#ffd040" stroke-width="2" filter="url(#achieveGlow)"/>
-  <circle cx="262" cy="155" r="38" fill="none" stroke="#fff" stroke-width="1.5" stroke-opacity=".35"/>
-  <text x="262" y="148" text-anchor="middle"
-        fill="#fff8e0"
-        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="20" font-weight="900" letter-spacing="-.5"
-        filter="url(#tagShadow)">160k+</text>
-  <text x="262" y="164" text-anchor="middle"
-        fill="#fff8e0"
-        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="13.5" font-weight="800" letter-spacing=".5"
-        filter="url(#tagShadow)">Req/s!</text>
-  <text x="262" y="178" text-anchor="middle"
-        fill="#ffe4a0"
-        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="8.5" font-weight="500" letter-spacing=".3"
-        filter="url(#tagShadow)">with 256 connections</text>
-
-  <polygon points="1138,101 1152,120 1176,117 1173,141 1192,155 1173,170 1176,193 1152,190 1138,209 1124,190 1100,193 1103,170 1084,155 1103,141 1100,117 1124,120"
-           fill="url(#achieveBadge)" stroke="#ffd040" stroke-width="2" filter="url(#achieveGlow)"/>
-  <circle cx="1138" cy="155" r="38" fill="none" stroke="#fff" stroke-width="1.5" stroke-opacity=".35"/>
-  <text x="1138" y="150" text-anchor="middle"
-        fill="#fff8e0"
-        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="19" font-weight="900" letter-spacing="-.5"
-        filter="url(#tagShadow)">~0.4ms</text>
-  <text x="1138" y="167" text-anchor="middle"
-        fill="#fff8e0"
-        font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-        font-size="13.5" font-weight="800" letter-spacing=".5"
-        filter="url(#tagShadow)">Latency!</text>
-
-  <!-- "by VRIL LABS" attribution — isolated group ensures it composites above glass layer -->
-  <g style="isolation:isolate">
-    <text x="1186" y="351" text-anchor="end"
-          fill="#ffd88b"
-          font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-          font-size="9.5" font-weight="600" letter-spacing="2.8"
-          opacity=".88" filter="url(#tagShadow)">by VRIL LABS</text>
-  </g>
 
 </svg>

@@ -25,7 +25,6 @@
 #![warn(missing_debug_implementations)]
 
 pub mod bench;
-pub mod boa_backend;
 pub mod dispatcher;
 pub mod engine;
 pub(crate) mod http1_utils;

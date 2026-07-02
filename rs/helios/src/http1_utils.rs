@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result};
+use std::io::IoSlice;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -7,6 +8,7 @@ use tokio::net::TcpStream;
 const HTTP_STATUS_CODE_START: usize = 9;
 const HTTP_STATUS_CODE_END: usize = 12;
 
+#[inline(always)]
 pub(crate) async fn write_all_fast(stream: &mut TcpStream, mut bytes: &[u8]) -> Result<()> {
     while !bytes.is_empty() {
         match stream.try_write(bytes) {
@@ -21,6 +23,57 @@ pub(crate) async fn write_all_fast(stream: &mut TcpStream, mut bytes: &[u8]) -> 
     Ok(())
 }
 
+#[inline(always)]
+pub(crate) async fn write_all_vectored_fast(
+    stream: &mut TcpStream,
+    first: &[u8],
+    second: &[u8],
+) -> Result<()> {
+    let mut first_written = 0usize;
+    let mut second_written = 0usize;
+
+    while first_written < first.len() || second_written < second.len() {
+        let n = if first_written < first.len() {
+            let bufs = [
+                IoSlice::new(&first[first_written..]),
+                IoSlice::new(&second[second_written..]),
+            ];
+            try_write_vectored_once(stream, &bufs).await?
+        } else {
+            let bufs = [IoSlice::new(&second[second_written..])];
+            try_write_vectored_once(stream, &bufs).await?
+        };
+
+        let first_remaining = first.len().saturating_sub(first_written);
+        if n <= first_remaining {
+            first_written += n;
+        } else {
+            first_written = first.len();
+            second_written += n.saturating_sub(first_remaining);
+        }
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+async fn try_write_vectored_once(stream: &mut TcpStream, bufs: &[IoSlice<'_>]) -> Result<usize> {
+    loop {
+        match stream.try_write_vectored(bufs) {
+            Ok(0) => {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                    .context("write socket");
+            }
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                stream.writable().await.context("wait writable socket")?;
+            }
+            Err(e) => return Err(e).context("write socket"),
+        }
+    }
+}
+
+#[inline(always)]
 pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
     let max_start = buf.len().checked_sub(4)?;
     if start > max_start {
@@ -36,6 +89,7 @@ pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+#[inline(always)]
 pub(crate) fn content_length(headers: &[u8]) -> Option<usize> {
     let mut start = 0usize;
     while start < headers.len() {
@@ -56,6 +110,7 @@ pub(crate) fn content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
+#[inline(always)]
 fn parse_ascii_usize(value: &[u8]) -> Option<usize> {
     let mut value = value;
     while matches!(value.first(), Some(b' ' | b'\t')) {
@@ -80,6 +135,7 @@ fn parse_ascii_usize(value: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+#[inline(always)]
 pub(crate) fn status_is_success(response_bytes: &[u8]) -> bool {
     matches!(
         response_bytes.get(HTTP_STATUS_CODE_START..HTTP_STATUS_CODE_END),

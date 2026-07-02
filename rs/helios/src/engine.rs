@@ -55,6 +55,20 @@ pub trait JsEngineBackend: Send + Sync + fmt::Debug {
     /// Invoke the module's registered `fetch` handler.
     fn call_fetch_handler(&self, handle: ModuleHandle, req_bytes: Bytes) -> Result<Bytes, JsError>;
 
+    /// Optional proactive fetch-handler warmup for JIT-capable backends.
+    fn warm_fetch_handler(
+        &self,
+        handle: ModuleHandle,
+        req_bytes: Bytes,
+        iterations: usize,
+    ) -> Result<(), JsError> {
+        for _ in 0..iterations {
+            let _ = self.call_fetch_handler(handle, req_bytes.clone())?;
+            self.drain_microtasks(handle)?;
+        }
+        Ok(())
+    }
+
     /// Optional zero-allocation static response for engines that can prove a
     /// handler does not depend on request data. Dynamic JavaScript engines
     /// should keep the default and use [`Self::call_fetch_handler`].

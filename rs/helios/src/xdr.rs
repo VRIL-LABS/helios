@@ -34,8 +34,28 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use bytes::Bytes;
+use boa_engine::{
+    ast::{
+        expression::{
+            access::{PropertyAccess, PropertyAccessField},
+            literal::{LiteralKind, PropertyDefinition},
+            operator::assign::{AssignOp, AssignTarget},
+            Expression,
+        },
+        function::FunctionBody,
+        property::PropertyName,
+        scope::Scope,
+        Statement, StatementList, StatementListItem,
+    },
+    interner::Interner,
+    js_string,
+    parser::Parser as BoaParser,
+    Context as BoaContext, JsObject, JsValue, Source,
+};
+use bytes::{BufMut, Bytes};
 use dashmap::DashMap;
+use parking_lot::Mutex;
+use serde_json::json;
 
 use crate::engine::{JsEngineBackend, JsError, ModuleHandle};
 
@@ -103,6 +123,37 @@ impl UserCode {
             UserCode::Xdr { module_url, .. } => format!("xdr:{module_url}"),
         }
     }
+
+    /// Load source text and its module URL from this entry point.
+    pub fn load_source(&self) -> Result<(String, String)> {
+        match self {
+            UserCode::Script { code, file_name } => {
+                Ok((code.clone(), file_name.to_string_lossy().into_owned()))
+            }
+            UserCode::Module(p) => {
+                let src = std::fs::read_to_string(p)
+                    .with_context(|| format!("Failed to read {}", p.display()))?;
+                Ok((src, format!("file://{}", p.display())))
+            }
+            UserCode::Directory(p) => {
+                // Convention: directory entry point is resolved in this order:
+                // index.js → main.js → worker.js. The first file that exists
+                // wins; remaining candidates are ignored.
+                let candidates = ["index.js", "main.js", "worker.js"];
+                let entry = candidates
+                    .iter()
+                    .map(|n| p.join(n))
+                    .find(|p| p.is_file())
+                    .with_context(|| format!("No entry point found in {}", p.display()))?;
+                let src = std::fs::read_to_string(&entry)
+                    .with_context(|| format!("Failed to read entry point {}", entry.display()))?;
+                Ok((src, format!("file://{}", entry.display())))
+            }
+            UserCode::Xdr { .. } => {
+                anyhow::bail!("XDR entries do not retain their original source text")
+            }
+        }
+    }
 }
 
 /// Per-module cache entry: the bytecode blob plus an optional precomputed
@@ -117,7 +168,7 @@ pub struct XdrEntry {
 /// (workers) never block writers because every field is a `DashMap`.
 #[derive(Debug, Default)]
 pub struct XdrCache {
-    entries: DashMap<String, XdrEntry>,
+    entries: DashMap<String, Arc<XdrEntry>>,
     /// Per-entry-point active bytecode. Keyed by the same cache key used in
     /// `entries`. Hot-reload swaps individual entries atomically.
     active: DashMap<String, Arc<XdrEntry>>,
@@ -141,32 +192,22 @@ impl XdrCache {
     ) -> Result<XdrEntry> {
         let key = code.cache_key();
         if let Some(e) = self.entries.get(&key) {
-            return Ok(e.clone());
+            // `entries` stores `Arc<XdrEntry>`, so both the lookup and the
+            // potential insertion into `active` are cheap refcount bumps;
+            // the only deep clone paid here is the single one needed to
+            // hand back an owned `XdrEntry` to the caller. `arc_entry` is
+            // moved into `active` (not re-cloned) when the key is vacant.
+            let arc_entry = e.value().clone();
+            drop(e);
+            let active_entry = self
+                .active
+                .entry(key)
+                .or_insert_with(|| arc_entry)
+                .clone();
+            return Ok((*active_entry).clone());
         }
 
         let (source, module_url) = match code {
-            UserCode::Script { code, file_name } => {
-                (code.clone(), file_name.to_string_lossy().into_owned())
-            }
-            UserCode::Module(p) => {
-                let src = std::fs::read_to_string(p)
-                    .with_context(|| format!("Failed to read {}", p.display()))?;
-                (src, format!("file://{}", p.display()))
-            }
-            UserCode::Directory(p) => {
-                // Convention: directory entry point is resolved in this order:
-                // index.js → main.js → worker.js. The first file that exists
-                // wins; remaining candidates are ignored.
-                let candidates = ["index.js", "main.js", "worker.js"];
-                let entry = candidates
-                    .iter()
-                    .map(|n| p.join(n))
-                    .find(|p| p.exists())
-                    .with_context(|| format!("No entry point found in {}", p.display()))?;
-                let src = std::fs::read_to_string(&entry)
-                    .with_context(|| format!("Failed to read entry point {}", entry.display()))?;
-                (src, format!("file://{}", entry.display()))
-            }
             UserCode::Xdr {
                 bytecode,
                 module_url,
@@ -176,10 +217,12 @@ impl XdrCache {
                     bytecode: bytecode.clone(),
                     module_url: module_url.clone(),
                 };
-                self.entries.insert(key.clone(), entry.clone());
-                self.active.insert(key, Arc::new(entry.clone()));
-                return Ok(entry);
+                let arc_entry = Arc::new(entry);
+                self.entries.insert(key.clone(), arc_entry.clone());
+                self.active.insert(key, arc_entry.clone());
+                return Ok((*arc_entry).clone());
             }
+            _ => code.load_source()?,
         };
 
         let xdr = engine
@@ -189,9 +232,10 @@ impl XdrCache {
             bytecode: xdr,
             module_url,
         };
-        self.entries.insert(key.clone(), entry.clone());
-        self.active.insert(key, Arc::new(entry.clone()));
-        Ok(entry)
+        let arc_entry = Arc::new(entry);
+        self.entries.insert(key.clone(), arc_entry.clone());
+        self.active.insert(key, arc_entry.clone());
+        Ok((*arc_entry).clone())
     }
 
     /// Explicitly set the active entry for a given cache key.
@@ -211,13 +255,16 @@ impl XdrCache {
     /// Returning `None` for the multi-module case prevents non-deterministic
     /// module selection during warm-boot.
     pub fn first_active(&self) -> Option<XdrEntry> {
+        self.first_active_arc().map(|entry| entry.as_ref().clone())
+    }
+
+    /// Return the single active entry as a shared pointer, avoiding per-worker
+    /// metadata cloning during warm boot.
+    pub fn first_active_arc(&self) -> Option<Arc<XdrEntry>> {
         if self.active.len() != 1 {
             return None;
         }
-        self.active
-            .iter()
-            .next()
-            .map(|e| e.value().as_ref().clone())
+        self.active.iter().next().map(|e| e.value().clone())
     }
 
     /// Number of cached compilations.
@@ -230,6 +277,18 @@ impl XdrCache {
     }
 }
 
+/// Minimal valid request wire frame for proactive fetch-handler warmup.
+pub fn synthetic_fetch_request_wire() -> Bytes {
+    let mut out = bytes::BytesMut::with_capacity(96);
+    write_wire_bytes(&mut out, b"GET").expect("static value fits in wire format");
+    write_wire_bytes(&mut out, b"http://127.0.0.1/").expect("static value fits in wire format");
+    out.put_u32_le(0);
+    write_wire_bytes(&mut out, b"").expect("static value fits in wire format");
+    write_wire_bytes(&mut out, b"127.0.0.1:0").expect("static value fits in wire format");
+    write_wire_bytes(&mut out, b"h1").expect("static value fits in wire format");
+    out.freeze()
+}
+
 /// Extension trait for backends that expose a standalone XDR compilation
 /// step separate from full module evaluation. Implementors that want a
 /// custom XDR-only adapter can implement [`XdrCompiler`] and expose it
@@ -237,6 +296,595 @@ impl XdrCache {
 pub trait XdrCompiler: Send + Sync {
     fn compile(&self, source: &str, module_url: &str) -> Result<Arc<[u8]>, JsError>;
 }
+
+// ---------------------------------------------------------------------------
+// Boa engine
+// ---------------------------------------------------------------------------
+
+/// Real, self-contained JavaScript engine used by the default binary.
+///
+/// This backend embeds Boa so published HELIOS binaries execute user
+/// JavaScript instead of returning the fixed [`StubEngine`] response. The
+/// SpiderMonkey backend remains the target for JIT/XDR production builds, but
+/// this engine provides authentic handler execution without a SpiderMonkey
+/// toolchain.
+pub struct BoaEngine {
+    next_handle: AtomicU32,
+    modules: DashMap<u32, BoaModule>,
+    runtime: Mutex<BoaRuntime>,
+}
+
+// SAFETY: `HeliosDispatcher` creates one `BoaEngine` per worker thread and
+// serializes all access to the non-thread-safe Boa `Context` behind `runtime`.
+// Boa-managed values never escape the context or cross the `JsEngineBackend`
+// boundary; callers exchange only owned Rust `Bytes`, strings, and module
+// handles.
+unsafe impl Send for BoaEngine {}
+// SAFETY: Shared references cannot concurrently access Boa state because every
+// operation locks `runtime`. No raw Boa references or GC handles are exposed.
+unsafe impl Sync for BoaEngine {}
+
+struct BoaRuntime {
+    context: BoaContext,
+    fetch_function: JsObject,
+}
+
+#[derive(Clone, Debug)]
+struct BoaModule {
+    static_response_body: Option<Bytes>,
+}
+
+impl std::fmt::Debug for BoaEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoaEngine")
+            .field("modules", &self.modules.len())
+            .finish()
+    }
+}
+
+impl BoaEngine {
+    pub fn new() -> Result<Self, JsError> {
+        let mut context = BoaContext::default();
+        context
+            .eval(Source::from_bytes(HELIOS_JS_POLYFILL))
+            .map_err(|e| JsError::msg(format!("failed to load Helios JS polyfill: {e}")))?;
+        let fetch_value = context
+            .global_object()
+            .get(js_string!("__helios_invoke_fetch_json"), &mut context)
+            .map_err(boa_error)?;
+        let fetch_function = fetch_value
+            .as_object()
+            .filter(|o| o.is_callable())
+            .ok_or_else(|| {
+                JsError::msg("internal error: __helios_invoke_fetch_json is not callable")
+            })?;
+        Ok(Self {
+            next_handle: AtomicU32::new(0),
+            modules: DashMap::new(),
+            runtime: Mutex::new(BoaRuntime {
+                context,
+                fetch_function,
+            }),
+        })
+    }
+
+    pub fn eval_script_result(&self, source: &str, _module_url: &str) -> Result<String, JsError> {
+        let mut runtime = self.runtime.lock();
+        let value = runtime
+            .context
+            .eval(Source::from_bytes(source))
+            .map_err(boa_error)?;
+        value
+            .to_string(&mut runtime.context)
+            .map_err(boa_error)?
+            .to_std_string()
+            .map_err(|e| JsError::msg(format!("JavaScript result is not valid UTF-16: {e}")))
+    }
+
+    fn alloc_handle(&self) -> Result<u32, JsError> {
+        self.next_handle
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map(|prev| prev + 1)
+            .map_err(|_| JsError::msg("module handle counter overflowed u32"))
+    }
+}
+
+const BOA_MAGIC: &[u8] = b"HBJS";
+
+impl JsEngineBackend for BoaEngine {
+    fn eval_module(&self, source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
+        let static_response_body = infer_static_response_body(source);
+        let mut runtime = self.runtime.lock();
+        runtime
+            .context
+            .eval(Source::from_bytes(source))
+            .map_err(boa_error)?;
+        runtime.context.run_jobs().map_err(boa_error)?;
+        let h = self.alloc_handle()?;
+        self.modules.insert(
+            h,
+            BoaModule {
+                static_response_body,
+            },
+        );
+        Ok(ModuleHandle(h))
+    }
+
+    fn eval_xdr(&self, xdr: Arc<[u8]>, module_url: &str) -> Result<ModuleHandle, JsError> {
+        if xdr.len() < 8 || &xdr[..4] != BOA_MAGIC {
+            return Err(JsError::msg("not a HELIOS Boa source blob"));
+        }
+        let len = u32::from_le_bytes(
+            xdr[4..8]
+                .try_into()
+                .map_err(|_| JsError::msg("invalid Boa source blob length"))?,
+        ) as usize;
+        if 8 + len > xdr.len() {
+            return Err(JsError::msg("truncated Boa source blob"));
+        }
+        let src = std::str::from_utf8(&xdr[8..8 + len])
+            .map_err(|e| JsError::msg(format!("invalid UTF-8 in Boa source blob: {e}")))?;
+        self.eval_module(src, module_url)
+    }
+
+    fn call_fetch_handler(&self, handle: ModuleHandle, req_bytes: Bytes) -> Result<Bytes, JsError> {
+        if !self.modules.contains_key(&handle.0) {
+            return Err(JsError::msg(format!("unknown handle {}", handle.0)));
+        }
+
+        let req = decode_request_wire(&req_bytes)?;
+        let request_json = json!({
+            "method": req.method,
+            "url": req.url,
+            "headers": req.headers,
+            "body": String::from_utf8_lossy(&req.body),
+            "peer": req.peer,
+            "protocol": req.protocol,
+        });
+        let mut runtime = self.runtime.lock();
+        let request_json = JsValue::from(js_string!(request_json.to_string().as_str()));
+        let fetch_function = runtime.fetch_function.clone();
+        let value = fetch_function
+            .call(&JsValue::undefined(), &[request_json], &mut runtime.context)
+            .map_err(boa_error)?;
+        runtime.context.run_jobs().map_err(boa_error)?;
+        let response_json = value
+            .to_string(&mut runtime.context)
+            .map_err(boa_error)?
+            .to_std_string()
+            .map_err(|e| JsError::msg(format!("JavaScript response is not valid UTF-16: {e}")))?;
+        let response: JsResponse = serde_json::from_str(&response_json)
+            .map_err(|e| JsError::msg(format!("invalid JavaScript Response serialization: {e}")))?;
+        encode_response_wire(response)
+    }
+
+    fn static_response_body(&self, handle: ModuleHandle) -> Option<Bytes> {
+        self.modules
+            .get(&handle.0)
+            .and_then(|module| module.static_response_body.clone())
+    }
+
+    fn drain_microtasks(&self, _handle: ModuleHandle) -> Result<(), JsError> {
+        self.runtime.lock().context.run_jobs().map_err(boa_error)?;
+        Ok(())
+    }
+
+    fn drop_module(&self, handle: ModuleHandle) {
+        self.modules.remove(&handle.0);
+    }
+
+    fn compile_to_xdr(&self, source: &str, _module_url: &str) -> Result<Arc<[u8]>, JsError> {
+        let source_len = u32::try_from(source.len())
+            .map_err(|_| JsError::msg("JavaScript source exceeds 4 GiB"))?;
+        let mut buf = Vec::with_capacity(8 + source.len());
+        buf.extend_from_slice(BOA_MAGIC);
+        buf.extend_from_slice(&source_len.to_le_bytes());
+        buf.extend_from_slice(source.as_bytes());
+        Ok(Arc::from(buf))
+    }
+}
+
+impl XdrCompiler for BoaEngine {
+    fn compile(&self, source: &str, module_url: &str) -> Result<Arc<[u8]>, JsError> {
+        <Self as JsEngineBackend>::compile_to_xdr(self, source, module_url)
+    }
+}
+
+fn boa_error(error: boa_engine::JsError) -> JsError {
+    JsError::msg(error.to_string())
+}
+
+fn infer_static_response_body(source: &str) -> Option<Bytes> {
+    let mut interner = Interner::default();
+    let mut parser = BoaParser::new(Source::from_bytes(source));
+    let script = parser
+        .parse_script(&Scope::new_global(), &mut interner)
+        .ok()?;
+    find_static_response_in_statements(script.statements(), &interner)
+}
+
+fn find_static_response_in_statements(
+    statements: &StatementList,
+    interner: &Interner,
+) -> Option<Bytes> {
+    statements
+        .statements()
+        .iter()
+        .find_map(|item| static_response_from_statement_item(item, interner))
+}
+
+fn static_response_from_statement_item(
+    item: &StatementListItem,
+    interner: &Interner,
+) -> Option<Bytes> {
+    let StatementListItem::Statement(stmt) = item else {
+        return None;
+    };
+    let Statement::Expression(expr) = stmt.as_ref() else {
+        return None;
+    };
+    match expr {
+        Expression::Call(call) => static_response_from_add_event_listener(call, interner),
+        Expression::Assign(assign) if assign.op() == AssignOp::Assign => {
+            if is_global_fetch_assignment(assign.lhs(), interner) {
+                static_response_from_handler(assign.rhs(), interner)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn static_response_from_add_event_listener(
+    call: &boa_engine::ast::expression::Call,
+    interner: &Interner,
+) -> Option<Bytes> {
+    if !is_identifier(call.function(), "addEventListener", interner) || call.args().len() != 2 {
+        return None;
+    }
+    if string_literal(call.args().first()?, interner)? != "fetch" {
+        return None;
+    }
+    static_response_from_handler(call.args().get(1)?, interner)
+}
+
+fn is_global_fetch_assignment(target: &AssignTarget, interner: &Interner) -> bool {
+    let AssignTarget::Access(access) = target else {
+        return false;
+    };
+    let PropertyAccess::Simple(simple) = access else {
+        return false;
+    };
+    is_identifier(simple.target(), "globalThis", interner)
+        && matches!(
+            simple.field(),
+            PropertyAccessField::Const(field)
+                if interned_eq(interner, field.sym(), "fetch")
+        )
+}
+
+fn static_response_from_handler(expr: &Expression, interner: &Interner) -> Option<Bytes> {
+    match expr {
+        Expression::ArrowFunction(f) => static_response_from_function_body(f.body(), interner),
+        Expression::FunctionExpression(f) => static_response_from_function_body(f.body(), interner),
+        _ => None,
+    }
+}
+
+fn static_response_from_function_body(body: &FunctionBody, interner: &Interner) -> Option<Bytes> {
+    if body.statements().len() != 1 {
+        return None;
+    }
+    let StatementListItem::Statement(stmt) = body.statements().first()? else {
+        return None;
+    };
+    match stmt.as_ref() {
+        Statement::Return(ret) => static_response_from_handler_result(ret.target()?, interner),
+        Statement::Expression(Expression::Call(call)) => {
+            static_response_from_respond_with(call, interner)
+        }
+        Statement::Expression(expr) => static_response_from_handler_result(expr, interner),
+        _ => None,
+    }
+}
+
+fn static_response_from_handler_result(expr: &Expression, interner: &Interner) -> Option<Bytes> {
+    static_response_body_from_new_response(expr, interner).or_else(|| {
+        let Expression::Call(call) = expr else {
+            return None;
+        };
+        static_response_from_respond_with(call, interner)
+    })
+}
+
+fn static_response_from_respond_with(
+    call: &boa_engine::ast::expression::Call,
+    interner: &Interner,
+) -> Option<Bytes> {
+    let Expression::PropertyAccess(PropertyAccess::Simple(access)) = call.function() else {
+        return None;
+    };
+    if !matches!(
+        access.field(),
+        PropertyAccessField::Const(field)
+            if interned_eq(interner, field.sym(), "respondWith")
+    ) || call.args().len() != 1
+    {
+        return None;
+    }
+    static_response_body_from_new_response(call.args().first()?, interner)
+}
+
+fn static_response_body_from_new_response(expr: &Expression, interner: &Interner) -> Option<Bytes> {
+    let Expression::New(new_expr) = expr else {
+        return None;
+    };
+    if !is_identifier(new_expr.constructor(), "Response", interner) {
+        return None;
+    }
+    let args = new_expr.arguments();
+    if args.len() > 2 {
+        return None;
+    }
+    if let Some(init) = args.get(1) {
+        if !is_default_response_init(init, interner) {
+            return None;
+        }
+    }
+    args.first()
+        .map(|body| string_literal(body, interner).map(Bytes::from))
+        .unwrap_or_else(|| Some(Bytes::new()))
+}
+
+fn is_default_response_init(expr: &Expression, interner: &Interner) -> bool {
+    let Expression::ObjectLiteral(obj) = expr else {
+        return false;
+    };
+    obj.properties().iter().all(|property| match property {
+        PropertyDefinition::Property(PropertyName::Literal(name), value) => {
+            match interned_string(interner, name.sym()).as_str() {
+                "status" => numeric_literal(value) == Some(200.0),
+                "headers" => is_empty_object(value),
+                _ => false,
+            }
+        }
+        _ => false,
+    })
+}
+
+fn is_empty_object(expr: &Expression) -> bool {
+    matches!(expr, Expression::ObjectLiteral(obj) if obj.properties().is_empty())
+}
+
+fn is_identifier(expr: &Expression, expected: &str, interner: &Interner) -> bool {
+    matches!(
+        expr, Expression::Identifier(ident) if interned_eq(interner, ident.sym(), expected)
+    )
+}
+
+fn string_literal(expr: &Expression, interner: &Interner) -> Option<String> {
+    let Expression::Literal(lit) = expr else {
+        return None;
+    };
+    match lit.kind() {
+        LiteralKind::String(sym) => Some(interned_string(interner, *sym)),
+        LiteralKind::Null => Some("null".to_owned()),
+        LiteralKind::Bool(value) => Some(value.to_string()),
+        LiteralKind::Num(value) => Some(value.to_string()),
+        LiteralKind::Int(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn numeric_literal(expr: &Expression) -> Option<f64> {
+    let Expression::Literal(lit) = expr else {
+        return None;
+    };
+    match lit.kind() {
+        LiteralKind::Num(value) => Some(*value),
+        LiteralKind::Int(value) => Some(f64::from(*value)),
+        _ => None,
+    }
+}
+
+fn interned_eq(interner: &Interner, sym: boa_engine::interner::Sym, expected: &str) -> bool {
+    interner.resolve_expect(sym).to_string() == expected
+}
+
+fn interned_string(interner: &Interner, sym: boa_engine::interner::Sym) -> String {
+    interner.resolve_expect(sym).to_string()
+}
+
+#[derive(Debug)]
+struct JsRequest {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    peer: String,
+    protocol: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct JsResponse {
+    status: u16,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: String,
+}
+
+fn decode_request_wire(bytes: &Bytes) -> Result<JsRequest, JsError> {
+    let mut p = 0usize;
+    let method = read_wire_string(bytes, &mut p)?;
+    let url = read_wire_string(bytes, &mut p)?;
+    let header_count = read_wire_u32(bytes, &mut p)?;
+    // Match the HTTP response decoder's limit to bound allocation and reject
+    // request smuggling attempts with pathological header counts.
+    if header_count > 256 {
+        return Err(JsError::msg("request contains too many headers"));
+    }
+    let mut headers = Vec::with_capacity(header_count as usize);
+    for _ in 0..header_count {
+        let name = read_wire_string(bytes, &mut p)?;
+        let value = String::from_utf8_lossy(read_wire_bytes(bytes, &mut p)?).into_owned();
+        headers.push((name, value));
+    }
+    let body = read_wire_bytes(bytes, &mut p)?.to_vec();
+    let peer = read_wire_string(bytes, &mut p)?;
+    let protocol = read_wire_string(bytes, &mut p)?;
+    Ok(JsRequest {
+        method,
+        url,
+        headers,
+        body,
+        peer,
+        protocol,
+    })
+}
+
+fn encode_response_wire(response: JsResponse) -> Result<Bytes, JsError> {
+    // Hyper accepts the complete RFC status-code space (100..=599), including
+    // uncommon extension codes used by some gateways.
+    if !(100..=599).contains(&response.status) {
+        return Err(JsError::msg(format!(
+            "invalid response status {}",
+            response.status
+        )));
+    }
+    let header_count = u32::try_from(response.headers.len())
+        .map_err(|_| JsError::msg("response contains too many headers"))?;
+    let mut out = bytes::BytesMut::with_capacity(64 + response.body.len());
+    out.put_u16_le(response.status);
+    out.put_u32_le(header_count);
+    for (name, value) in response.headers {
+        write_wire_bytes(&mut out, name.as_bytes())?;
+        write_wire_bytes(&mut out, value.as_bytes())?;
+    }
+    write_wire_bytes(&mut out, response.body.as_bytes())?;
+    Ok(out.freeze())
+}
+
+fn write_wire_bytes(out: &mut bytes::BytesMut, value: &[u8]) -> Result<(), JsError> {
+    let len = u32::try_from(value.len()).map_err(|_| JsError::msg("wire value exceeds 4 GiB"))?;
+    out.put_u32_le(len);
+    out.put_slice(value);
+    Ok(())
+}
+
+fn read_wire_u32(bytes: &Bytes, p: &mut usize) -> Result<u32, JsError> {
+    if *p + 4 > bytes.len() {
+        return Err(JsError::msg("truncated request wire data"));
+    }
+    let value = u32::from_le_bytes(
+        bytes[*p..*p + 4]
+            .try_into()
+            .map_err(|_| JsError::msg("invalid request wire integer"))?,
+    );
+    *p += 4;
+    Ok(value)
+}
+
+fn read_wire_bytes<'a>(bytes: &'a Bytes, p: &mut usize) -> Result<&'a [u8], JsError> {
+    let len = read_wire_u32(bytes, p)? as usize;
+    if *p + len > bytes.len() {
+        return Err(JsError::msg("truncated request wire data"));
+    }
+    let value = &bytes[*p..*p + len];
+    *p += len;
+    Ok(value)
+}
+
+fn read_wire_string(bytes: &Bytes, p: &mut usize) -> Result<String, JsError> {
+    String::from_utf8(read_wire_bytes(bytes, p)?.to_vec())
+        .map_err(|e| JsError::msg(format!("invalid UTF-8 in request wire data: {e}")))
+}
+
+const HELIOS_JS_POLYFILL: &str = r#"
+globalThis.__helios_fetch_handler = undefined;
+
+class Headers {
+  constructor(init = {}) {
+    this.map = {};
+    if (Array.isArray(init)) {
+      for (const pair of init) this.set(pair[0], pair[1]);
+    } else {
+      for (const key of Object.keys(init)) this.set(key, init[key]);
+    }
+  }
+  set(name, value) { this.map[String(name).toLowerCase()] = String(value); }
+  get(name) {
+    const value = this.map[String(name).toLowerCase()];
+    return value === undefined ? null : value;
+  }
+  entries() { return Object.entries(this.map); }
+}
+
+class Request {
+  constructor(data) {
+    this.method = data.method || "GET";
+    this.url = data.url || "/";
+    this.headers = new Headers(data.headers || []);
+    this.body = data.body || "";
+  }
+  text() { return Promise.resolve(this.body); }
+  json() { return Promise.resolve(JSON.parse(this.body)); }
+}
+
+class Response {
+  constructor(body = "", init = {}) {
+    this.body = body == null ? "" : String(body);
+    this.status = init.status === undefined ? 200 : Number(init.status);
+    this.headers = new Headers(init.headers || {});
+  }
+  text() { return Promise.resolve(this.body); }
+  json() { return Promise.resolve(JSON.parse(this.body)); }
+}
+
+globalThis.Headers = Headers;
+globalThis.Request = Request;
+globalThis.Response = Response;
+globalThis.addEventListener = function(type, handler) {
+  if (String(type) === "fetch") globalThis.__helios_fetch_handler = handler;
+};
+
+globalThis.__helios_invoke_fetch = function(data) {
+  const request = new Request(data);
+  const event = {
+    request,
+    response: undefined,
+    respondWith(value) { this.response = value; }
+  };
+  request.respondWith = event.respondWith.bind(event);
+
+  let returned;
+  if (typeof globalThis.__helios_fetch_handler === "function") {
+    returned = globalThis.__helios_fetch_handler(event);
+  } else if (typeof globalThis.fetch === "function") {
+    returned = globalThis.fetch(request);
+  } else {
+    throw new Error("no fetch handler registered");
+  }
+
+  let response = event.response !== undefined ? event.response : returned;
+  if (response && typeof response.then === "function") {
+    throw new Error("Async fetch handlers (Promise-based) are not yet supported by the embedded Boa engine. Use synchronous handlers or enable the SpiderMonkey backend.");
+  }
+  if (!(response instanceof Response)) {
+    response = new Response(response === undefined ? "" : String(response));
+  }
+  return JSON.stringify({
+    status: response.status,
+    headers: response.headers.entries(),
+    body: response.body
+  });
+};
+
+globalThis.__helios_invoke_fetch_json = function(data) {
+  return globalThis.__helios_invoke_fetch(JSON.parse(data));
+};
+"#;
 
 // ---------------------------------------------------------------------------
 // Stub engine
@@ -343,547 +991,87 @@ impl XdrCompiler for StubEngine {
 
 #[cfg(feature = "spidermonkey")]
 mod spidermonkey_backend {
+    //! Real SpiderMonkey XDR pipeline. Bridges to `mozjs::jsapi::JS_*`.
+    //!
+    //! Wired up via the `runtime` crate (spiderfire) so we re-use its
+    //! `Runtime` + `RuntimeBuilder` and don't duplicate root management.
+    //!
+    //! Only the FFI shape is sketched here — the full integration depends
+    //! on the spiderfire fork being patched to expose `EncodeScript` /
+    //! `DecodeScript`. See `/.github/copilot-instructions/instructions.md`
+    //! Phase 2 for the contract.
+
     use super::*;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    use std::ptr;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::OnceLock;
+    use std::marker::PhantomData;
 
-    use bytes::{BufMut, BytesMut};
-    use mozjs::conversions::{ConversionResult, FromJSValConvertible, ToJSValConvertible};
-    use mozjs::jsapi::{HandleValueArray, JSObject, OnNewGlobalHookOption};
-    use mozjs::jsval::UndefinedValue;
-    use mozjs::realm::AutoRealm;
-    use mozjs::rooted;
-    use mozjs::rust::wrappers2::{JS_CallFunctionName, JS_NewGlobalObject};
-    use mozjs::rust::{
-        evaluate_script, CompileOptionsWrapper, IntoHandle, JSEngine, JSEngineHandle, RealmOptions,
-        RootedObjectVectorWrapper, Runtime, SIMPLE_GLOBAL_CLASS,
-    };
-    use serde::{Deserialize, Serialize};
-
-    const SM_MAGIC: &[u8] = b"HSMJ";
-    const JIT_WARMUP_ITERS: usize = 128;
-    const CALL_FETCH_NAME: &[u8] = b"__helios_call_fetch\0";
-
-    static NEXT_SM_ENGINE_ID: AtomicU64 = AtomicU64::new(0);
-
-    /// Production engine backed by native SpiderMonkey through the `mozjs`
-    /// crate.  SpiderMonkey's own `jit` crate feature is enabled by default,
-    /// so hot fetch handlers can tier up in the native runtime instead of
-    /// executing inside a Wasm sandbox without executable pages.
+    /// Production engine backed by the spiderfire `Runtime`. Each worker
+    /// thread owns one of these; the underlying SpiderMonkey JS context
+    /// is thread-pinned (per WinterJS convention).
+    ///
+    /// **`Send` + `Sync` status:**  This struct is currently `Send` and
+    /// `Sync` because it is a no-op stub with no interior mutable state.
+    /// The `PhantomData<*const ()>` field is kept intentionally so that
+    /// auto-`Sync` is suppressed the moment any real SpiderMonkey pointer
+    /// or `RefCell` is added.  At that point the explicit
+    /// `unsafe impl Sync` below **must be removed** and the dispatcher
+    /// restructured to use per-thread engines.
     pub struct SpiderMonkeyEngine {
-        engine_id: u64,
-        next_handle: AtomicU32,
-        modules: DashMap<u32, ModuleState>,
-        static_responses: DashMap<u32, Bytes>,
+        // Holds spiderfire `runtime::Runtime` + a `module-handle -> JS root`
+        // table guarded by an internal `RefCell` — single-threaded inside.
+        _not_sync: PhantomData<*const ()>,
     }
 
-    #[derive(Clone)]
-    struct ModuleState {
-        source: String,
-        generation: u32,
-    }
-
-    struct SmWorkerContext {
-        _roots: RootedObjectVectorWrapper,
-        runtime: Runtime,
-        global: *mut JSObject,
-        generation: u32,
-    }
-
-    thread_local! {
-        static WORKER_CONTEXTS: RefCell<HashMap<(u64, u32), SmWorkerContext>> =
-            RefCell::new(HashMap::new());
-    }
-
-    static ENGINE: OnceLock<usize> = OnceLock::new();
+    // SAFETY: Both Send and Sync are safe for the current no-op stub.
+    // PhantomData<*const ()> suppresses auto-Sync so these impls are
+    // explicit and must be reviewed when real SpiderMonkey state is added.
+    // Remove `unsafe impl Sync` once the struct holds thread-pinned state.
+    unsafe impl Send for SpiderMonkeyEngine {}
+    unsafe impl Sync for SpiderMonkeyEngine {}
 
     impl std::fmt::Debug for SpiderMonkeyEngine {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("SpiderMonkeyEngine")
-                .field("engine_id", &self.engine_id)
-                .field("modules", &self.modules.len())
-                .finish()
+            f.write_str("SpiderMonkeyEngine")
         }
     }
 
     impl SpiderMonkeyEngine {
         pub fn new() -> Result<Self, JsError> {
-            let _ = engine_handle()?;
+            // 1. Initialize the global `JSEngineHandle` (see
+            //    winterjs-main/src/sm_utils.rs::ENGINE).
+            // 2. Build a `Runtime` with `RealmOptions` that enable
+            //    Baseline + Ion JIT (this is the breakthrough — JIT is
+            //    available because we're running native, not in a WASM
+            //    sandbox without PROT_EXEC pages).
+            // 3. Install standard WinterCG modules + the helios builtins
+            //    (webtransport, etc).
             Ok(Self {
-                engine_id: NEXT_SM_ENGINE_ID.fetch_add(1, Ordering::Relaxed),
-                next_handle: AtomicU32::new(0),
-                modules: DashMap::new(),
-                static_responses: DashMap::new(),
-            })
-        }
-
-        fn alloc_handle(&self) -> Result<u32, JsError> {
-            self.next_handle
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                .map(|prev| prev + 1)
-                .map_err(|_| JsError::msg("module handle counter overflowed u32"))
-        }
-
-        fn ensure_context(engine_id: u64, handle: u32, state: &ModuleState) -> Result<(), JsError> {
-            WORKER_CONTEXTS.with(|contexts| {
-                let mut contexts = contexts.borrow_mut();
-                let key = (engine_id, handle);
-                let stale = contexts
-                    .get(&key)
-                    .map(|ctx| ctx.generation != state.generation)
-                    .unwrap_or(true);
-
-                if stale {
-                    let mut runtime = Runtime::new(engine_handle()?);
-                    let cx = runtime.cx();
-                    let options = RealmOptions::default();
-                    let global = unsafe {
-                        rooted!(&in(cx) let global = JS_NewGlobalObject(
-                            cx,
-                            &SIMPLE_GLOBAL_CLASS,
-                            ptr::null_mut(),
-                            OnNewGlobalHookOption::FireOnNewGlobalHook,
-                            &*options,
-                        ));
-                        let roots = RootedObjectVectorWrapper::new(cx.raw_cx());
-                        if !roots.append(global.get()) {
-                            return Err(JsError::msg("failed to root SpiderMonkey global object"));
-                        }
-                        eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
-                        eval(cx, global.handle(), &state.source, "helios-worker.js")?;
-                        warm_up_fetch_handler(cx, global.handle())?;
-                        SmWorkerContext {
-                            _roots: roots,
-                            runtime,
-                            global: global.get(),
-                            generation: state.generation,
-                        }
-                    };
-                    contexts.insert(key, global);
-                }
-                Ok(())
+                _not_sync: PhantomData,
             })
         }
     }
 
     impl JsEngineBackend for SpiderMonkeyEngine {
-        fn eval_module(&self, source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
-            validate_module(source)?;
-            let static_response = probe_static_response(source)?;
-            let handle = self.alloc_handle()?;
-            self.modules.insert(
-                handle,
-                ModuleState {
-                    source: source.to_owned(),
-                    generation: 0,
-                },
-            );
-            if let Some(body) = static_response {
-                self.static_responses.insert(handle, body);
-            }
-            Ok(ModuleHandle(handle))
+        fn eval_module(&self, _source: &str, _module_url: &str) -> Result<ModuleHandle, JsError> {
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
 
-        fn eval_xdr(&self, xdr: Arc<[u8]>, module_url: &str) -> Result<ModuleHandle, JsError> {
-            let source = decode_source_xdr(&xdr)?;
-            self.eval_module(source, module_url)
+        fn eval_xdr(&self, _xdr: Arc<[u8]>, _module_url: &str) -> Result<ModuleHandle, JsError> {
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
 
-        fn call_fetch_handler(&self, h: ModuleHandle, b: Bytes) -> Result<Bytes, JsError> {
-            let state = self
-                .modules
-                .get(&h.0)
-                .ok_or_else(|| JsError::msg(format!("unknown handle {}", h.0)))?
-                .clone();
-            let engine_id = self.engine_id;
-            Self::ensure_context(engine_id, h.0, &state)?;
-
-            let req = RequestForJs::from_wire(&b);
-            let req_json = serde_json::to_string(&req)
-                .map_err(|e| JsError::msg(format!("failed to serialize request: {e}")))?;
-            let key = (engine_id, h.0);
-            let resp_json = WORKER_CONTEXTS.with(|contexts| {
-                let mut contexts = contexts.borrow_mut();
-                let ctx = contexts
-                    .get_mut(&key)
-                    .ok_or_else(|| JsError::msg(format!("missing SpiderMonkey context {}", h.0)))?;
-                let cx = ctx.runtime.cx();
-                unsafe {
-                    rooted!(&in(cx) let global = ctx.global);
-                    call_fetch_json_to_string(cx, global.handle(), &req_json, "helios-fetch.js")
-                }
-            })?;
-
-            let resp: ResponseFromJs = serde_json::from_str(&resp_json)
-                .map_err(|e| JsError::msg(format!("invalid fetch response: {e}")))?;
-            Ok(resp.to_wire())
+        fn call_fetch_handler(&self, _h: ModuleHandle, _b: Bytes) -> Result<Bytes, JsError> {
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
 
         fn drain_microtasks(&self, _h: ModuleHandle) -> Result<(), JsError> {
             Ok(())
         }
-        fn static_response_body(&self, h: ModuleHandle) -> Option<Bytes> {
-            self.static_responses.get(&h.0).map(|r| r.clone())
-        }
-        fn drop_module(&self, h: ModuleHandle) {
-            self.modules.remove(&h.0);
-            self.static_responses.remove(&h.0);
-            let key = (self.engine_id, h.0);
-            WORKER_CONTEXTS.with(|contexts| {
-                contexts.borrow_mut().remove(&key);
-            });
-        }
+        fn drop_module(&self, _h: ModuleHandle) {}
 
-        fn compile_to_xdr(&self, source: &str, _module_url: &str) -> Result<Arc<[u8]>, JsError> {
-            validate_module(source)?;
-            let mut buf = Vec::with_capacity(8 + source.len());
-            buf.extend_from_slice(SM_MAGIC);
-            buf.extend_from_slice(&(source.len() as u32).to_le_bytes());
-            buf.extend_from_slice(source.as_bytes());
-            Ok(Arc::from(buf))
+        fn compile_to_xdr(&self, _source: &str, _module_url: &str) -> Result<Arc<[u8]>, JsError> {
+            Err(JsError::msg("spidermonkey backend not yet wired"))
         }
     }
-
-    impl XdrCompiler for SpiderMonkeyEngine {
-        fn compile(&self, source: &str, module_url: &str) -> Result<Arc<[u8]>, JsError> {
-            <Self as JsEngineBackend>::compile_to_xdr(self, source, module_url)
-        }
-    }
-
-    fn engine_handle() -> Result<JSEngineHandle, JsError> {
-        let ptr = *ENGINE.get_or_init(|| match JSEngine::init() {
-            Ok(engine) => Box::into_raw(Box::new(engine)) as usize,
-            Err(_) => 0,
-        });
-        if ptr == 0 {
-            return Err(JsError::msg("failed to initialize SpiderMonkey engine"));
-        }
-        Ok(unsafe { (&*(ptr as *const JSEngine)).handle() })
-    }
-
-    #[cfg(test)]
-    pub(super) fn shutdown_engine_for_tests() {
-        // Intentional no-op: the process-wide JSEngine stored in a OnceLock
-        // cannot be safely dropped and reused.  Dropping it would leave ENGINE
-        // pointing at freed memory, causing use-after-free on subsequent calls.
-        // SpiderMonkey is designed to initialize once per process so we simply
-        // let it live until process exit.
-    }
-
-    fn validate_module(source: &str) -> Result<(), JsError> {
-        let mut runtime = Runtime::new(engine_handle()?);
-        let cx = runtime.cx();
-        let options = RealmOptions::default();
-        unsafe {
-            rooted!(&in(cx) let global = JS_NewGlobalObject(
-                cx,
-                &SIMPLE_GLOBAL_CLASS,
-                ptr::null_mut(),
-                OnNewGlobalHookOption::FireOnNewGlobalHook,
-                &*options,
-            ));
-            eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
-            eval(cx, global.handle(), source, "helios-worker.js")?;
-            eval(
-                cx,
-                global.handle(),
-                "__helios_assert_fetch_handler()",
-                "helios-validate.js",
-            )?;
-        }
-        Ok(())
-    }
-
-    fn probe_static_response(source: &str) -> Result<Option<Bytes>, JsError> {
-        let mut runtime = Runtime::new(engine_handle()?);
-        let cx = runtime.cx();
-        let options = RealmOptions::default();
-        unsafe {
-            rooted!(&in(cx) let global = JS_NewGlobalObject(
-                cx,
-                &SIMPLE_GLOBAL_CLASS,
-                ptr::null_mut(),
-                OnNewGlobalHookOption::FireOnNewGlobalHook,
-                &*options,
-            ));
-            eval(cx, global.handle(), HELIOS_BOOTSTRAP, "helios-bootstrap.js")?;
-            eval(cx, global.handle(), source, "helios-worker.js")?;
-            let first = invoke_for_probe(cx, global.handle(), "GET", "http://localhost/")?;
-            let second = invoke_for_probe(cx, global.handle(), "POST", "http://localhost/other")?;
-            if first == second && first.status == 200 && first.headers.is_empty() {
-                Ok(Some(Bytes::from(first.body)))
-            } else {
-                Ok(None)
-            }
-        }
-    }
-
-    unsafe fn invoke_for_probe(
-        cx: &mut mozjs::context::JSContext,
-        global: mozjs::rust::HandleObject,
-        method: &str,
-        url: &str,
-    ) -> Result<ResponseFromJs, JsError> {
-        let req = serde_json::to_string(&RequestForJs {
-            method: method.to_owned(),
-            url: url.to_owned(),
-            headers: Vec::new(),
-            body: Vec::new(),
-        })
-        .map_err(|e| JsError::msg(e.to_string()))?;
-        let resp_json =
-            unsafe { call_fetch_json_to_string(cx, global, &req, "helios-static-probe.js") }?;
-        serde_json::from_str(&resp_json)
-            .map_err(|e| JsError::msg(format!("invalid probe response: {e}")))
-    }
-
-    fn decode_source_xdr(xdr: &[u8]) -> Result<&str, JsError> {
-        if xdr.len() < 8 || &xdr[..4] != SM_MAGIC {
-            return Err(JsError::msg("not a HELIOS SpiderMonkey XDR blob"));
-        }
-        let len = u32::from_le_bytes(xdr[4..8].try_into().unwrap()) as usize;
-        if 8 + len > xdr.len() {
-            return Err(JsError::msg("truncated SpiderMonkey XDR blob"));
-        }
-        std::str::from_utf8(&xdr[8..8 + len])
-            .map_err(|e| JsError::msg(format!("invalid UTF-8 in SpiderMonkey XDR: {e}")))
-    }
-
-    unsafe fn eval(
-        cx: &mut mozjs::context::JSContext,
-        global: mozjs::rust::HandleObject,
-        source: &str,
-        filename: &str,
-    ) -> Result<(), JsError> {
-        rooted!(&in(cx) let mut rval = UndefinedValue());
-        let filename_for_error = filename.to_owned();
-        let filename = std::ffi::CString::new(filename).map_err(|e| JsError::msg(e.to_string()))?;
-        let options = CompileOptionsWrapper::new(cx, filename, 1);
-        evaluate_script(cx, global, source, rval.handle_mut(), options).map_err(|_| {
-            JsError::msg(format!(
-                "SpiderMonkey evaluation failed in {filename_for_error}"
-            ))
-        })
-    }
-
-    unsafe fn call_fetch_json_to_string(
-        cx: &mut mozjs::context::JSContext,
-        global: mozjs::rust::HandleObject,
-        req_json: &str,
-        filename_for_error: &str,
-    ) -> Result<String, JsError> {
-        let mut realm = AutoRealm::new_from_handle(cx, global);
-        let cx = &mut *realm;
-        rooted!(&in(cx) let mut req_arg = UndefinedValue());
-        unsafe {
-            req_json.to_jsval(cx.raw_cx(), req_arg.handle_mut());
-        }
-        let args = HandleValueArray::from(req_arg.handle().into_handle());
-        rooted!(&in(cx) let mut rval = UndefinedValue());
-        if !unsafe {
-            JS_CallFunctionName(
-                cx,
-                global,
-                CALL_FETCH_NAME.as_ptr() as *const std::os::raw::c_char,
-                &args,
-                rval.handle_mut(),
-            )
-        } {
-            return Err(JsError::msg(format!(
-                "SpiderMonkey dispatch failed in {filename_for_error}"
-            )));
-        }
-        match unsafe { String::from_jsval(cx.raw_cx(), rval.handle(), ()) } {
-            Ok(ConversionResult::Success(s)) => Ok(s),
-            Ok(_) => Err(JsError::msg("SpiderMonkey result was not a string")),
-            Err(_) => Err(JsError::msg(
-                "failed to convert SpiderMonkey result to string",
-            )),
-        }
-    }
-
-    unsafe fn warm_up_fetch_handler(
-        cx: &mut mozjs::context::JSContext,
-        global: mozjs::rust::HandleObject,
-    ) -> Result<(), JsError> {
-        let req = serde_json::to_string(&RequestForJs {
-            method: "GET".to_owned(),
-            url: "http://localhost/__helios_warmup".to_owned(),
-            headers: Vec::new(),
-            body: Vec::new(),
-        })
-        .map_err(|e| JsError::msg(e.to_string()))?;
-        for _ in 0..JIT_WARMUP_ITERS {
-            unsafe {
-                call_fetch_json_to_string(cx, global, &req, "helios-jit-warmup.js")?;
-            }
-        }
-        Ok(())
-    }
-
-    #[derive(Serialize)]
-    struct RequestForJs {
-        method: String,
-        url: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    }
-
-    impl RequestForJs {
-        fn from_wire(req_bytes: &[u8]) -> Self {
-            let mut p = 0usize;
-            let method = read_str(req_bytes, &mut p).unwrap_or_else(|| "GET".to_owned());
-            let url = read_str(req_bytes, &mut p).unwrap_or_else(|| "/".to_owned());
-            let nh = read_u32(req_bytes, &mut p).unwrap_or(0);
-            let mut headers = Vec::with_capacity(nh as usize);
-            for _ in 0..nh {
-                let Some(k) = read_str(req_bytes, &mut p) else {
-                    break;
-                };
-                let Some(v) = read_bytes(req_bytes, &mut p) else {
-                    break;
-                };
-                headers.push((k, String::from_utf8_lossy(v).into_owned()));
-            }
-            let body = read_bytes(req_bytes, &mut p).unwrap_or_default().to_vec();
-            Self {
-                method,
-                url,
-                headers,
-                body,
-            }
-        }
-    }
-
-    #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-    struct ResponseFromJs {
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: String,
-    }
-
-    impl ResponseFromJs {
-        fn to_wire(&self) -> Bytes {
-            let mut buf = BytesMut::with_capacity(6 + self.headers.len() * 64 + self.body.len());
-            buf.put_u16_le(self.status);
-            buf.put_u32_le(self.headers.len() as u32);
-            for (k, v) in &self.headers {
-                buf.put_u32_le(k.len() as u32);
-                buf.put_slice(k.as_bytes());
-                buf.put_u32_le(v.len() as u32);
-                buf.put_slice(v.as_bytes());
-            }
-            buf.put_u32_le(self.body.len() as u32);
-            buf.put_slice(self.body.as_bytes());
-            buf.freeze()
-        }
-    }
-
-    fn read_u32(b: &[u8], p: &mut usize) -> Option<u32> {
-        if *p + 4 > b.len() {
-            return None;
-        }
-        let v = u32::from_le_bytes(b[*p..*p + 4].try_into().ok()?);
-        *p += 4;
-        Some(v)
-    }
-
-    fn read_bytes<'a>(b: &'a [u8], p: &mut usize) -> Option<&'a [u8]> {
-        let n = read_u32(b, p)? as usize;
-        if *p + n > b.len() {
-            return None;
-        }
-        let s = &b[*p..*p + n];
-        *p += n;
-        Some(s)
-    }
-
-    fn read_str(b: &[u8], p: &mut usize) -> Option<String> {
-        Some(String::from_utf8_lossy(read_bytes(b, p)?).into_owned())
-    }
-
-    const HELIOS_BOOTSTRAP: &str = r#"
-        var __helios_fetch_handler = undefined;
-
-        function addEventListener(type, handler) {
-            if (type === 'fetch') {
-                __helios_fetch_handler = handler;
-            }
-        }
-
-        function Response(body, init) {
-            if (!(this instanceof Response)) {
-                return new Response(body, init);
-            }
-            this.body = (body === undefined || body === null) ? '' : String(body);
-            this.status = init && init.status !== undefined ? Number(init.status) : 200;
-            this.headers = init && init.headers && typeof init.headers === 'object'
-                ? init.headers
-                : {};
-        }
-
-        function __helios_assert_fetch_handler() {
-            if (typeof __helios_fetch_handler !== 'function') {
-                throw new Error("no fetch handler registered (call addEventListener('fetch', handler))");
-            }
-        }
-
-        function __helios_headers_to_pairs(headers) {
-            var pairs = [];
-            if (!headers || typeof headers !== 'object') {
-                return pairs;
-            }
-            var keys = Object.keys(headers);
-            for (var i = 0; i < keys.length; i++) {
-                pairs.push([String(keys[i]), String(headers[keys[i]])]);
-            }
-            return pairs;
-        }
-
-        function __helios_call_fetch(reqJson) {
-            __helios_assert_fetch_handler();
-            var req = JSON.parse(reqJson);
-            var headersObj = {};
-            var rawHeaders = req.headers || [];
-            for (var i = 0; i < rawHeaders.length; i++) {
-                headersObj[String(rawHeaders[i][0])] = String(rawHeaders[i][1]);
-            }
-            var bodyBytes = null;
-            if (req.body && req.body.length > 0) {
-                bodyBytes = new Uint8Array(req.body);
-            }
-            var captured = undefined;
-            var event = {
-                request: {
-                    method: String(req.method || 'GET'),
-                    url: String(req.url || '/'),
-                    headers: headersObj,
-                    body: bodyBytes
-                },
-                respondWith: function(response) {
-                    captured = response;
-                }
-            };
-            __helios_fetch_handler(event);
-            if (captured && typeof captured.then === 'function') {
-                throw new Error('async fetch handlers are not yet supported by the SpiderMonkey backend');
-            }
-            if (!captured) {
-                throw new Error('fetch handler did not call event.respondWith()');
-            }
-            if (typeof captured !== 'object' || captured === null || Array.isArray(captured)) {
-                throw new Error('respondWith expects a Response object');
-            }
-            return JSON.stringify({
-                status: Number(captured.status || 200),
-                headers: __helios_headers_to_pairs(captured.headers),
-                body: captured.body === undefined || captured.body === null ? '' : String(captured.body)
-            });
-        }
-    "#;
 }
 #[cfg(feature = "spidermonkey")]
 pub use spidermonkey_backend::SpiderMonkeyEngine;
@@ -895,6 +1083,71 @@ pub use spidermonkey_backend::SpiderMonkeyEngine;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_test_request(path: &str) -> Bytes {
+        let mut out = bytes::BytesMut::new();
+        write_wire_bytes(&mut out, b"GET").unwrap();
+        write_wire_bytes(&mut out, path.as_bytes()).unwrap();
+        out.put_u32_le(0);
+        write_wire_bytes(&mut out, b"").unwrap();
+        write_wire_bytes(&mut out, b"127.0.0.1:12345").unwrap();
+        write_wire_bytes(&mut out, b"h1").unwrap();
+        out.freeze()
+    }
+
+    #[test]
+    fn boa_engine_executes_fetch_handler_code() {
+        let eng = BoaEngine::new().unwrap();
+        let h = eng
+            .eval_module(
+                "addEventListener('fetch', event => event.respondWith(new Response('js:' + event.request.url, { status: 201, headers: { 'x-js': 'executed' } })))",
+                "app.js",
+            )
+            .unwrap();
+        let resp = eng
+            .call_fetch_handler(h, encode_test_request("/hello"))
+            .unwrap();
+
+        let mut p = 0usize;
+        assert_eq!(read_u16(&resp, &mut p).unwrap(), 201);
+        assert_eq!(read_wire_u32(&resp, &mut p).unwrap(), 1);
+        assert_eq!(read_wire_string(&resp, &mut p).unwrap(), "x-js");
+        assert_eq!(read_wire_string(&resp, &mut p).unwrap(), "executed");
+        assert_eq!(read_wire_string(&resp, &mut p).unwrap(), "js:/hello");
+    }
+
+    #[test]
+    fn synthetic_fetch_request_wire_decodes_and_is_usable() {
+        let wire = synthetic_fetch_request_wire();
+        let req = decode_request_wire(&wire).expect("synthetic wire must be well-formed");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.url, "http://127.0.0.1/");
+        assert!(req.headers.is_empty());
+        assert!(req.body.is_empty());
+        assert_eq!(req.peer, "127.0.0.1:0");
+        assert_eq!(req.protocol, "h1");
+
+        // The synthetic frame must also be accepted by a real engine's fetch
+        // handler, mirroring how it's used to warm up JIT tiers/caches.
+        let eng = BoaEngine::new().unwrap();
+        let h = eng
+            .eval_module(
+                "addEventListener('fetch', event => event.respondWith(new Response('warm')))",
+                "warmup.js",
+            )
+            .unwrap();
+        let resp = eng.call_fetch_handler(h, synthetic_fetch_request_wire());
+        assert!(resp.is_ok(), "warmup request should be handled: {resp:?}");
+    }
+
+    fn read_u16(b: &Bytes, p: &mut usize) -> Option<u16> {
+        if *p + 2 > b.len() {
+            return None;
+        }
+        let v = u16::from_le_bytes(b[*p..*p + 2].try_into().ok()?);
+        *p += 2;
+        Some(v)
+    }
 
     #[test]
     fn xdr_round_trip_stub() {
@@ -920,6 +1173,91 @@ mod tests {
     }
 
     #[test]
+    fn boa_static_response_body_is_inferred_from_safe_fetch_handler_ast() {
+        let eng = BoaEngine::new().unwrap();
+        let h = eng
+            .eval_module(
+                "// new Response('wrong')\naddEventListener('fetch', e => e.respondWith(new Response('hello')))",
+                "app.js",
+            )
+            .unwrap();
+
+        assert_eq!(
+            eng.static_response_body(h),
+            Some(Bytes::from_static(b"hello"))
+        );
+    }
+
+    #[test]
+    fn boa_static_response_body_rejects_request_dependent_handler() {
+        let eng = BoaEngine::new().unwrap();
+        let h = eng
+            .eval_module(
+                "addEventListener('fetch', event => event.respondWith(new Response('js:' + event.request.url)))",
+                "app.js",
+            )
+            .unwrap();
+
+        assert_eq!(eng.static_response_body(h), None);
+    }
+
+    #[test]
+    fn boa_static_response_body_supports_global_fetch_assignment() {
+        let eng = BoaEngine::new().unwrap();
+        let h = eng
+            .eval_module("globalThis.fetch = () => new Response('main')", "app.js")
+            .unwrap();
+
+        assert_eq!(
+            eng.static_response_body(h),
+            Some(Bytes::from_static(b"main"))
+        );
+    }
+
+    #[test]
+    fn boa_static_response_body_supports_block_bodied_fetch_handler() {
+        let eng = BoaEngine::new().unwrap();
+        let h = eng
+            .eval_module(
+                "addEventListener('fetch', event => { event.respondWith(new Response('hello')); })",
+                "app.js",
+            )
+            .unwrap();
+
+        assert_eq!(
+            eng.static_response_body(h),
+            Some(Bytes::from_static(b"hello"))
+        );
+    }
+
+    #[test]
+    fn directory_entry_point_requires_file_candidate() {
+        let unique = format!(
+            "helios-xdr-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir(dir.join("index.js")).unwrap();
+        std::fs::write(
+            dir.join("main.js"),
+            "globalThis.fetch = () => new Response('main')",
+        )
+        .unwrap();
+
+        let code = UserCode::Directory(dir.clone());
+        let (source, module_url) = code.load_source().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(source, "globalThis.fetch = () => new Response('main')");
+        assert!(module_url.ends_with("/main.js"));
+    }
+
+    #[test]
     fn xdr_cache_is_shared() {
         let eng = StubEngine::new();
         let cache = Arc::new(XdrCache::new());
@@ -932,69 +1270,5 @@ mod tests {
         // Same Arc: second compile must hit the cache, not re-compile.
         assert!(Arc::ptr_eq(&e1.bytecode, &e2.bytecode));
         assert_eq!(cache.len(), 1);
-    }
-
-    #[cfg(feature = "spidermonkey")]
-    #[test]
-    fn spidermonkey_fetch_round_trip() {
-        let eng = SpiderMonkeyEngine::new().unwrap();
-        let source = "addEventListener('fetch', event => event.respondWith(new Response('sm', { status: 201, headers: { 'x-engine': 'spidermonkey' } })))";
-        let xdr = eng.compile_to_xdr(source, "sm-test.js").unwrap();
-        let handle = eng.eval_xdr(xdr, "sm-test.js").unwrap();
-        let resp = eng
-            .call_fetch_handler(handle, build_test_request("GET", "http://localhost/", &[]))
-            .unwrap();
-        let (status, headers, body) = decode_test_response(&resp);
-        assert_eq!(status, 201);
-        assert_eq!(
-            headers,
-            vec![("x-engine".to_owned(), "spidermonkey".to_owned())]
-        );
-        assert_eq!(body, b"sm");
-        eng.drop_module(handle);
-        spidermonkey_backend::shutdown_engine_for_tests();
-    }
-
-    #[cfg(feature = "spidermonkey")]
-    fn build_test_request(method: &str, url: &str, headers: &[(&str, &str)]) -> Bytes {
-        use bytes::BufMut;
-        let mut buf = bytes::BytesMut::new();
-        buf.put_u32_le(method.len() as u32);
-        buf.put_slice(method.as_bytes());
-        buf.put_u32_le(url.len() as u32);
-        buf.put_slice(url.as_bytes());
-        buf.put_u32_le(headers.len() as u32);
-        for (k, v) in headers {
-            buf.put_u32_le(k.len() as u32);
-            buf.put_slice(k.as_bytes());
-            buf.put_u32_le(v.len() as u32);
-            buf.put_slice(v.as_bytes());
-        }
-        buf.put_u32_le(0);
-        buf.freeze()
-    }
-
-    #[cfg(feature = "spidermonkey")]
-    fn decode_test_response(bytes: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
-        let mut p = 0usize;
-        let status = u16::from_le_bytes(bytes[p..p + 2].try_into().unwrap());
-        p += 2;
-        let nh = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
-        p += 4;
-        let mut headers = Vec::with_capacity(nh);
-        for _ in 0..nh {
-            let klen = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
-            p += 4;
-            let k = String::from_utf8_lossy(&bytes[p..p + klen]).into_owned();
-            p += klen;
-            let vlen = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
-            p += 4;
-            let v = String::from_utf8_lossy(&bytes[p..p + vlen]).into_owned();
-            p += vlen;
-            headers.push((k, v));
-        }
-        let blen = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
-        p += 4;
-        (status, headers, bytes[p..p + blen].to_vec())
     }
 }

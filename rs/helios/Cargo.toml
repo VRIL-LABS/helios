@@ -15,7 +15,7 @@ default = []
 # WIT host modules expose a stub `JsEngineBackend` impl so the rest of the
 # crate (dispatcher, HTTP/3, bench, CLI) compiles and runs standalone.
 # Enabling this requires the SpiderMonkey/mozjs build toolchain.
-spidermonkey = ["dep:mozjs"]
+spidermonkey = []
 # Enable Wizer integration as a library dependency rather than subprocess.
 wizer-lib = ["dep:wizer"]
 
@@ -56,9 +56,6 @@ wizer = { workspace = true, optional = true }
 hdrhistogram.workspace = true
 reqwest.workspace = true
 
-# JS execution (Boa)
-boa_engine.workspace = true
-
 # Misc
 anyhow.workspace = true
 thiserror.workspace = true
@@ -69,10 +66,13 @@ serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 memchr.workspace = true
+mimalloc.workspace = true
 once_cell.workspace = true
 arc-swap.workspace = true
 ring.workspace = true
-mozjs = { version = "0.15.14", optional = true }
+boa_engine.workspace = true
+socket2.workspace = true
+libc.workspace = true
 
 [[bin]]
 name = "helios"

@@ -7,7 +7,7 @@
 //! 1. Reads a global `AtomicUsize` round-robin counter, OR walks the per-
 //!    worker `queue_depths` slice and picks the least-loaded one.
 //! 2. Sends `ControlMessage::HandleRequest(req, oneshot_tx)` to that
-//!    worker's unbounded channel.
+//!    worker's bounded lock-free queue.
 //! 3. Returns immediately. The worker drives the JS event loop and
 //!    completes the oneshot.
 //!
@@ -18,7 +18,7 @@
 //!
 //! Each worker thread runs a current-thread tokio `Runtime` + `LocalSet`
 //! (same model as WinterJS). The thread owns its [`JsEngineBackend`]
-//! instance and a `tokio::sync::mpsc::UnboundedReceiver<ControlMessage>`.
+//! instance and a bounded lock-free worker queue.
 //!
 //! Health is monitored asynchronously: a worker that returns `Err` from
 //! `eval_xdr` more than `MAX_WORKER_FAILURES` times in a row is marked
@@ -31,13 +31,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use crossbeam::channel;
+use crossbeam_queue::ArrayQueue;
+use parking_lot::{Condvar, Mutex};
 use tokio::sync::oneshot;
 
 use crate::engine::{JsEngineBackend, JsError, ModuleHandle};
-use crate::xdr::{XdrCache, XdrEntry};
+use crate::xdr::{synthetic_fetch_request_wire, XdrCache, XdrEntry};
 
 const MAX_WORKER_FAILURES: u32 = 5;
+const WORKER_QUEUE_CAPACITY: usize = 4096;
 
 /// Opaque request blob handed to a worker. The encoding is Cap'n Proto
 /// per `wit/helios-rpc.capnp` (see Phase 3), but the dispatcher itself is
@@ -105,15 +107,15 @@ impl fmt::Debug for ControlMessage {
 #[derive(Debug)]
 pub struct WorkerHandle {
     pub id: usize,
-    tx: channel::Sender<ControlMessage>,
+    queue: Arc<WorkerQueue>,
     pub queue_depth: Arc<AtomicU32>,
     pub failures: Arc<AtomicU32>,
     pub dead: Arc<AtomicBool>,
 }
 
 impl WorkerHandle {
-    pub fn send(&self, msg: ControlMessage) -> Result<(), ()> {
-        self.tx.send(msg).map_err(|_| ())
+    pub fn send(&self, msg: ControlMessage) -> Result<(), SendError> {
+        self.queue.push(msg)
     }
 
     pub fn queue_depth(&self) -> u32 {
@@ -122,6 +124,93 @@ impl WorkerHandle {
 
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
+    }
+}
+
+/// Distinguishes a queue that has been permanently closed (the worker is
+/// gone and should be treated as dead) from one that is merely full
+/// (transient backpressure — the worker is still healthy and should not
+/// be evicted).
+#[derive(Debug)]
+pub enum SendError {
+    /// The worker's queue has been closed; the message is returned.
+    Closed(ControlMessage),
+    /// The worker's queue is at capacity; the message is returned.
+    Full(ControlMessage),
+}
+
+impl SendError {
+    fn into_message(self) -> ControlMessage {
+        match self {
+            SendError::Closed(msg) | SendError::Full(msg) => msg,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorkerQueue {
+    queue: ArrayQueue<ControlMessage>,
+    parked: Mutex<()>,
+    ready: Condvar,
+    closed: AtomicBool,
+}
+
+impl WorkerQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: ArrayQueue::new(capacity),
+            parked: Mutex::new(()),
+            ready: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn push(&self, msg: ControlMessage) -> Result<(), SendError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(SendError::Closed(msg));
+        }
+        let msg = match self.queue.push(msg) {
+            Ok(()) => {
+                // Hold `parked` while notifying so a receiver that is
+                // between its `is_empty()` check and `ready.wait(..)`
+                // cannot miss this wakeup: it must either observe the
+                // pushed item before checking, or already be registered
+                // with the condvar (and thus be woken) because it can
+                // only call `wait` while holding this same mutex.
+                let _guard = self.parked.lock();
+                self.ready.notify_one();
+                return Ok(());
+            }
+            Err(msg) => msg,
+        };
+        // Re-check `closed` after a failed push: the queue may have been
+        // closed concurrently between the check above and the push
+        // attempt, in which case this should be reported as `Closed`
+        // rather than `Full`.
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(SendError::Closed(msg));
+        }
+        Err(SendError::Full(msg))
+    }
+
+    fn recv(&self) -> Option<ControlMessage> {
+        loop {
+            if let Some(msg) = self.queue.pop() {
+                return Some(msg);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let mut guard = self.parked.lock();
+            if self.queue.is_empty() && !self.closed.load(Ordering::Acquire) {
+                self.ready.wait(&mut guard);
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.ready.notify_all();
     }
 }
 
@@ -184,8 +273,34 @@ impl HeliosDispatcher {
         E: JsEngineBackend + 'static,
         F: Fn() -> anyhow::Result<E> + Send + Sync + 'static,
     {
+        Self::spawn_with_warmup(n, policy, cache, make_engine, 0)
+    }
+
+    /// Spawn workers and proactively invoke each worker's fetch handler after
+    /// XDR evaluation to warm backend JIT tiers and request wrapper caches.
+    pub fn spawn_with_warmup<E, F>(
+        n: usize,
+        policy: DispatchPolicy,
+        cache: Arc<XdrCache>,
+        make_engine: F,
+        warmup_fetches: usize,
+    ) -> anyhow::Result<Arc<Self>>
+    where
+        E: JsEngineBackend + 'static,
+        F: Fn() -> anyhow::Result<E> + Send + Sync + 'static,
+    {
         anyhow::ensure!(n > 0, "n must be > 0");
         let make_engine = Arc::new(make_engine);
+        let available_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    requested_workers = n,
+                    "available_parallelism() failed; falling back to requested worker count for CPU-aware sizing"
+                );
+                n
+            });
 
         let mut workers = Vec::with_capacity(n);
         let mut depths = Vec::with_capacity(n);
@@ -193,34 +308,38 @@ impl HeliosDispatcher {
             let depth = Arc::new(AtomicU32::new(0));
             let failures = Arc::new(AtomicU32::new(0));
             let dead = Arc::new(AtomicBool::new(false));
-            let (tx, rx) = channel::unbounded();
+            let queue = Arc::new(WorkerQueue::new(WORKER_QUEUE_CAPACITY));
             let cache_for_worker = cache.clone();
             let mk = make_engine.clone();
             let depth_for_worker = depth.clone();
             let failures_for_worker = failures.clone();
             let dead_for_worker = dead.clone();
+            let queue_for_worker = queue.clone();
 
             std::thread::Builder::new()
                 .name(format!("helios-worker-{id}"))
                 .spawn(move || {
+                    pin_current_thread_to_cpu(id % available_cpus);
                     if let Err(e) = run_worker(
                         id,
-                        rx,
+                        queue_for_worker.clone(),
                         depth_for_worker,
                         failures_for_worker.clone(),
                         dead_for_worker.clone(),
                         cache_for_worker,
                         mk,
+                        warmup_fetches,
                     ) {
                         tracing::error!(worker = id, error = %e, "worker exited with error");
                         failures_for_worker.fetch_add(1, Ordering::Release);
                         dead_for_worker.store(true, Ordering::Release);
                     }
+                    queue_for_worker.close();
                 })?;
 
             workers.push(WorkerHandle {
                 id,
-                tx,
+                queue,
                 queue_depth: depth.clone(),
                 failures,
                 dead,
@@ -249,16 +368,26 @@ impl HeliosDispatcher {
         match self.pick_worker() {
             Some(w) => {
                 w.queue_depth.fetch_add(1, Ordering::AcqRel);
-                if w.send(ControlMessage::HandleRequest(req, tx)).is_err() {
-                    // Channel closed — worker is dead. Recover by sending
-                    // a synthetic error back; the dispatcher's health
-                    // watcher will respawn.
-                    w.dead.store(true, Ordering::Release);
+                if let Err(err) = w.send(ControlMessage::HandleRequest(req, tx)) {
                     w.queue_depth.fetch_sub(1, Ordering::AcqRel);
-                    // We already consumed `tx` above; create a new pair.
-                    // Easier: just rely on the receiver dropping. Since we
-                    // moved `tx` into the failed send, the receiver will
-                    // observe Closed.
+                    let is_closed = matches!(err, SendError::Closed(_));
+                    let ControlMessage::HandleRequest(_, tx) = err.into_message() else {
+                        unreachable!("dispatch() only ever sends ControlMessage::HandleRequest");
+                    };
+                    if is_closed {
+                        // Queue closed — the worker is gone. Mark it dead
+                        // so future dispatches route elsewhere.
+                        w.dead.store(true, Ordering::Release);
+                        let _ = tx.send(ResponseData::RequestError(JsError::msg(
+                            "worker queue unavailable",
+                        )));
+                    } else {
+                        // Queue full — transient backpressure. The worker
+                        // is still healthy; don't evict it.
+                        let _ = tx.send(ResponseData::RequestError(JsError::msg(
+                            "worker queue full",
+                        )));
+                    }
                 }
             }
             None => {
@@ -302,6 +431,7 @@ impl HeliosDispatcher {
         if n == 0 {
             return None;
         }
+
         if n == 1 {
             return self.workers.first().filter(|w| !w.is_dead());
         }
@@ -376,18 +506,41 @@ impl HeliosDispatcher {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_cpu(cpu: usize) {
+    // SAFETY: `cpu_set_t` is a plain C bitset. The libc helpers initialize and
+    // mutate it before `sched_setaffinity` borrows it for the current thread
+    // (`pid` 0). Failure is non-fatal because containers may restrict affinity.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            tracing::debug!(
+                cpu,
+                error = %std::io::Error::last_os_error(),
+                "failed to pin worker thread"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to_cpu(_cpu: usize) {}
+
 // ---------------------------------------------------------------------------
 // Worker driver
 // ---------------------------------------------------------------------------
 
 fn run_worker<E, F>(
     id: usize,
-    rx: channel::Receiver<ControlMessage>,
+    queue: Arc<WorkerQueue>,
     queue_depth: Arc<AtomicU32>,
     failures: Arc<AtomicU32>,
     dead: Arc<AtomicBool>,
     cache: Arc<XdrCache>,
     make_engine: Arc<F>,
+    warmup_fetches: usize,
 ) -> anyhow::Result<()>
 where
     E: JsEngineBackend + 'static,
@@ -398,10 +551,25 @@ where
 
     // Boot: if the cache has an active entry, eval it now so the very
     // first request finds the module ready.
-    if let Some(entry) = cache.first_active() {
+    if let Some(entry) = cache.first_active_arc() {
         match engine.eval_xdr(entry.bytecode.clone(), &entry.module_url) {
             Ok(h) => {
                 handle = Some(h);
+                if warmup_fetches > 0 {
+                    let req = synthetic_fetch_request_wire();
+                    match engine.warm_fetch_handler(h, req, warmup_fetches) {
+                        Ok(()) => tracing::debug!(
+                            worker = id,
+                            iterations = warmup_fetches,
+                            "fetch handler warmup complete"
+                        ),
+                        Err(e) => tracing::debug!(
+                            worker = id,
+                            error = %e,
+                            "fetch handler warmup skipped after backend error"
+                        ),
+                    }
+                }
                 tracing::debug!(worker = id, "warm boot: module ready");
             }
             Err(e) => {
@@ -411,7 +579,7 @@ where
         }
     }
 
-    while let Ok(msg) = rx.recv() {
+    while let Some(msg) = queue.recv() {
         match msg {
             ControlMessage::HandleRequest(req, tx) => {
                 let resp = match handle {
@@ -460,6 +628,7 @@ where
                     engine.drop_module(h);
                 }
                 let _ = ack.send(());
+                queue.close();
                 break;
             }
         }

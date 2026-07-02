@@ -6,40 +6,25 @@
 //!   helios bench <url>                — built-in load generator.
 //!   helios exec  <script.js>          — one-shot script execution.
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use helios::bench;
-#[cfg(not(feature = "spidermonkey"))]
-use helios::boa_backend::BoaEngine;
 use helios::dispatcher::{DispatchPolicy, HeliosDispatcher};
 use helios::engine::JsEngineBackend;
 use helios::http3::{run_server, InlineEngine, ServerConfig, TlsConfig};
 use helios::wizer_build;
-#[cfg(feature = "spidermonkey")]
-use helios::xdr::SpiderMonkeyEngine;
-use helios::xdr::{UserCode, XdrCache};
-
-#[cfg(feature = "spidermonkey")]
-type ActiveEngine = SpiderMonkeyEngine;
-#[cfg(not(feature = "spidermonkey"))]
-type ActiveEngine = BoaEngine;
-
-#[cfg(feature = "spidermonkey")]
-fn new_engine() -> Result<ActiveEngine> {
-    SpiderMonkeyEngine::new().map_err(|err| anyhow::anyhow!("SpiderMonkey init failed: {err}"))
-}
-
-#[cfg(not(feature = "spidermonkey"))]
-fn new_engine() -> Result<ActiveEngine> {
-    Ok(BoaEngine::new())
-}
+use helios::xdr::{BoaEngine, UserCode, XdrCache};
 
 #[derive(Parser, Debug)]
 #[command(name = "helios", version, about = "HELIOS — JIT at the edge. Finally.")]
@@ -91,6 +76,9 @@ struct Serve {
     /// Graceful shutdown timeout in seconds. 0 = disabled.
     #[arg(short = 't', long, default_value_t = 60)]
     shutdown_timeout: u64,
+    /// Proactive fetch invocations per worker before accepting traffic.
+    #[arg(long, env = "HELIOS_FETCH_WARMUP", default_value_t = 0)]
+    warmup_fetch: usize,
 }
 
 #[derive(Parser, Debug)]
@@ -197,6 +185,28 @@ fn num_cpus() -> usize {
         .unwrap_or(8)
 }
 
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_cpu(cpu: usize) {
+    // SAFETY: `cpu_set_t` is zero-initialized before the libc CPU macros set a
+    // single CPU bit. `sched_setaffinity` is applied to the current thread
+    // (`pid` 0); failures are debug-only because affinity may be unavailable.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            tracing::debug!(
+                cpu,
+                error = %std::io::Error::last_os_error(),
+                "failed to pin tokio runtime thread"
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to_cpu(_cpu: usize) {}
+
 fn install_tracing() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("helios=info,warn"));
@@ -209,7 +219,20 @@ fn install_tracing() {
 fn main() -> Result<()> {
     install_tracing();
     let cli = Cli::parse();
+    let cpus = num_cpus();
+    let next_runtime_cpu = Arc::new(AtomicUsize::new(0));
+    let runtime_cpu = next_runtime_cpu.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(cpus)
+        .max_blocking_threads(cpus.max(2))
+        .thread_name("helios-tokio")
+        .on_thread_start(move || {
+            // `SeqCst` guarantees each concurrently-starting Tokio thread
+            // observes a unique, monotonically increasing counter value, so
+            // CPU pinning assignments never collide or get reordered.
+            let cpu = runtime_cpu.fetch_add(1, Ordering::SeqCst) % cpus;
+            pin_current_thread_to_cpu(cpu);
+        })
         .enable_all()
         .build()?;
     rt.block_on(async move {
@@ -225,25 +248,43 @@ fn main() -> Result<()> {
 async fn cmd_serve(s: Serve) -> Result<()> {
     let user_code = UserCode::from_path(&s.js_path, s.script)?;
     let cache = Arc::new(XdrCache::new());
-    let bootstrap_engine = Arc::new(new_engine()?);
-    cache.compile_user_code(bootstrap_engine.as_ref(), &user_code)?;
-
-    let entry = cache
-        .first_active()
-        .ok_or_else(|| anyhow::anyhow!("compiled module missing from XDR cache"))?;
-    let inline_handle = bootstrap_engine
+    let bootstrap_engine = Arc::new(
+        BoaEngine::new()
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("Failed to initialize Boa JavaScript engine")?,
+    );
+    let entry = cache.compile_user_code(bootstrap_engine.as_ref(), &user_code)?;
+    let inline_static = bootstrap_engine
         .eval_xdr(entry.bytecode.clone(), &entry.module_url)
-        .map_err(|e| anyhow::anyhow!("inline engine warmup failed: {e}"))?;
+        .ok()
+        .and_then(|handle| {
+            if let Some(static_response_body) = bootstrap_engine.static_response_body(handle) {
+                Some(InlineEngine {
+                    engine: bootstrap_engine.clone(),
+                    handle,
+                    static_response_body: Some(static_response_body),
+                })
+            } else {
+                bootstrap_engine.drop_module(handle);
+                None
+            }
+        });
 
-    let dispatcher = HeliosDispatcher::spawn(s.workers, s.policy.into(), cache, new_engine)?;
+    let dispatcher = HeliosDispatcher::spawn_with_warmup(
+        s.workers,
+        s.policy.into(),
+        cache,
+        || BoaEngine::new().map_err(|e| anyhow::anyhow!("{e}")),
+        s.warmup_fetch,
+    )?;
     tracing::info!(workers = dispatcher.worker_count(),
         policy = ?DispatchPolicy::from(s.policy), "dispatcher up");
 
     let addr = SocketAddr::new(s.ip, s.port);
-    let mut cfg = ServerConfig::plain(addr).with_inline_engine(InlineEngine {
-        engine: bootstrap_engine,
-        handle: inline_handle,
-    });
+    let mut cfg = ServerConfig::plain(addr);
+    if let Some(inline) = inline_static {
+        cfg = cfg.with_inline_engine(inline);
+    }
     if let Some(av) = s.alt_svc {
         cfg = cfg.with_alt_svc(av);
     }
@@ -319,12 +360,12 @@ async fn cmd_bench(b: Bench) -> Result<()> {
 }
 
 fn cmd_exec(e: Exec) -> Result<()> {
-    let source = std::fs::read_to_string(&e.js_path)
-        .map_err(|err| anyhow::anyhow!("failed to read {}: {err}", e.js_path.display()))?;
-    let module_url = e.js_path.display().to_string();
-    let engine = new_engine()?;
-    engine
-        .eval_module(&source, &module_url)
-        .map_err(|err| anyhow::anyhow!("exec failed: {err}"))?;
+    let user_code = UserCode::from_path(&e.js_path, e.script)?;
+    let (source, module_url) = user_code.load_source()?;
+    let engine = BoaEngine::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let result = engine
+        .eval_script_result(&source, &module_url)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("{result}");
     Ok(())
 }

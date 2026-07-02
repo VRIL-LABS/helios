@@ -1,6 +1,6 @@
 # Helios public package
 
-Version: v1.1.0-beta
+Version: v1.2.0-rc1
 Target: x86_64-unknown-linux-gnu
 
 Contents:
@@ -9,5 +9,5 @@ Contents:
 - `rs/` — Rust workspace source (helios crate) for crates.io publishing.
 - `bench/` — benchmark fixtures for local smoke tests.
 - `assets/helios-header.svg` — project header graphic.
-- `README.md` — polished public package README.
+- `README-PUBLIC.md` — polished public package README.
 - `LICENSE` — MIT license.

@@ -27,12 +27,12 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use tokio::io::AsyncReadExt;
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tokio::net::TcpListener;
 
 use crate::dispatcher::{HeliosDispatcher, Protocol, RequestData, ResponseData};
 use crate::engine::{JsEngineBackend, ModuleHandle};
-use crate::http1_utils::{content_length, find_header_end_from, write_all_fast};
+use crate::http1_utils::{find_header_end_from, write_all_fast, write_all_vectored_fast};
 
 /// TLS / listener config for the dual-stack server.
 #[derive(Clone, Debug)]
@@ -59,6 +59,7 @@ pub struct TlsConfig {
 pub struct InlineEngine {
     pub engine: Arc<dyn JsEngineBackend>,
     pub handle: ModuleHandle,
+    pub static_response_body: Option<Bytes>,
 }
 
 impl ServerConfig {
@@ -111,16 +112,17 @@ pub async fn run_server(
 // HTTP/1.1 + HTTP/2 leg (hyper 1.x)
 // ---------------------------------------------------------------------------
 
+const STATIC_H1_FLAT_RESPONSE_MAX: usize = 1024;
+
 async fn serve_h1h2(config: ServerConfig, dispatcher: Arc<HeliosDispatcher>) -> Result<()> {
-    let listener = TcpListener::bind(config.addr)
-        .await
-        .with_context(|| format!("bind TCP {}", config.addr))?;
+    let listener =
+        bind_tcp_listener(config.addr).with_context(|| format!("bind TCP {}", config.addr))?;
     tracing::info!(addr = %config.addr, "h1+h2 listener up");
 
     let static_response = config
         .inline_engine
         .as_ref()
-        .and_then(|inline| inline.engine.static_response_body(inline.handle))
+        .and_then(|inline| inline.static_response_body.clone())
         .filter(|_| config.alt_svc.is_none())
         .map(build_static_h1_response);
 
@@ -176,98 +178,252 @@ async fn serve_h1h2(config: ServerConfig, dispatcher: Arc<HeliosDispatcher>) -> 
     }
 }
 
-fn build_static_h1_response(body: Bytes) -> Arc<[u8]> {
-    let mut response = Vec::with_capacity(64 + body.len());
-    response.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-length: ");
-    response.extend_from_slice(body.len().to_string().as_bytes());
-    response.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n");
-    response.extend_from_slice(&body);
-    Arc::from(response)
+fn bind_tcp_listener(addr: SocketAddr) -> Result<TcpListener> {
+    let socket = Socket::new(
+        Domain::for_address(addr),
+        Type::STREAM,
+        Some(SocketProtocol::TCP),
+    )
+    .context("create TCP socket")?;
+    socket.set_reuse_address(true).context("set SO_REUSEADDR")?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true).context("set SO_REUSEPORT")?;
+    // Buffer sizing is a best-effort tuning knob: some kernels/containers
+    // restrict SO_RCVBUF/SO_SNDBUF, and failing to widen them shouldn't
+    // prevent the server from starting.
+    if let Err(e) = socket.set_recv_buffer_size(1 << 20) {
+        tracing::warn!(error = %e, "failed to set SO_RCVBUF, continuing with default");
+    }
+    if let Err(e) = socket.set_send_buffer_size(1 << 20) {
+        tracing::warn!(error = %e, "failed to set SO_SNDBUF, continuing with default");
+    }
+    socket.set_nonblocking(true).context("set nonblocking")?;
+    socket.bind(&addr.into()).context("bind TCP socket")?;
+    socket.listen(4096).context("listen TCP socket")?;
+    let listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(listener).context("convert TCP listener")
+}
+
+#[derive(Clone, Debug)]
+enum StaticH1Response {
+    Flat(Arc<[u8]>),
+    Split { head: Arc<[u8]>, body: Bytes },
+}
+
+fn build_static_h1_response(body: Bytes) -> StaticH1Response {
+    let mut head = Vec::with_capacity(64);
+    head.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-length: ");
+    head.extend_from_slice(body.len().to_string().as_bytes());
+    head.extend_from_slice(b"\r\nconnection: keep-alive\r\n\r\n");
+    if body.len() <= STATIC_H1_FLAT_RESPONSE_MAX {
+        let mut response = Vec::with_capacity(head.len() + body.len());
+        response.extend_from_slice(&head);
+        response.extend_from_slice(&body);
+        StaticH1Response::Flat(Arc::from(response))
+    } else {
+        StaticH1Response::Split {
+            head: Arc::from(head),
+            body,
+        }
+    }
 }
 
 async fn serve_static_h1_connection(
     stream: &mut tokio::net::TcpStream,
-    response: &[u8],
+    response: &StaticH1Response,
 ) -> Result<()> {
-    // 64KB buffer allows reading many pipelined requests per syscall.
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = [0u8; 16 * 1024];
     let mut len = 0usize;
     let mut header_scan = 0usize;
-    loop {
+    'readable: loop {
         if len == buf.len() {
             anyhow::bail!("h1 request buffer exceeded {} bytes", buf.len());
         }
-        let n = stream
-            .read(&mut buf[len..])
-            .await
-            .context("read h1 request")?;
-        if n == 0 {
-            return Ok(());
+        stream.readable().await.context("wait readable socket")?;
+        loop {
+            match stream.try_read(&mut buf[len..]) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    len += n;
+                    // Avoid a zero-length `try_read`, which would report
+                    // `Ok(0)` as a no-op rather than a socket close; the
+                    // outer loop emits the canonical request-too-large error.
+                    if len == buf.len() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e).context("read h1 request"),
+            }
         }
-        len += n;
 
-        // Process all complete requests in the buffer before reading again.
-        // Batch responses: count how many complete requests are available and
-        // write all responses in a single syscall when possible.
-        let mut requests_ready = 0u32;
         while let Some(header_end) = find_header_end_from(&buf[..len], header_scan) {
             let headers = &buf[..header_end];
-            let body_len = h1_request_body_len(headers);
+            let framing = h1_request_framing(headers);
+            if framing.has_transfer_encoding {
+                return Ok(());
+            }
+            let body_len = framing.body_len;
             let request_len = header_end + 4 + body_len;
             if len < request_len {
                 header_scan = header_end;
                 break;
             }
-            requests_ready += 1;
+            match response {
+                StaticH1Response::Flat(flat) => {
+                    write_all_fast(stream, flat)
+                        .await
+                        .context("write h1 response")?;
+                }
+                StaticH1Response::Split { head, body } => {
+                    write_all_vectored_fast(stream, head, body)
+                        .await
+                        .context("write h1 response")?;
+                }
+            }
 
             if request_len == len {
                 len = 0;
                 header_scan = 0;
-                break;
+                continue 'readable;
             }
             buf.copy_within(request_len..len, 0);
             len -= request_len;
             header_scan = 0;
         }
 
-        // Write all pending responses in one batch.
-        if requests_ready > 0 {
-            if requests_ready == 1 {
-                write_all_fast(stream, response)
-                    .await
-                    .context("write h1 response")?;
-            } else {
-                // Batch write: repeat the response N times into a single buffer.
-                let batch_len = response.len() * requests_ready as usize;
-                let mut batch = Vec::with_capacity(batch_len);
-                for _ in 0..requests_ready {
-                    batch.extend_from_slice(response);
-                }
-                write_all_fast(stream, &batch)
-                    .await
-                    .context("write h1 batch response")?;
-            }
-        }
-
-        if find_header_end_from(&buf[..len], header_scan).is_none() {
+        if len != 0 && find_header_end_from(&buf[..len], header_scan).is_none() {
             header_scan = len.saturating_sub(3);
         }
     }
 }
 
+#[cfg(test)]
 fn h1_request_body_len(headers: &[u8]) -> usize {
-    content_length(headers).unwrap_or(0)
+    h1_request_framing(headers).body_len
+}
+
+#[cfg(test)]
+fn has_content_length_header(headers: &[u8]) -> bool {
+    h1_request_framing(headers).has_content_length
+}
+
+#[cfg(test)]
+fn has_transfer_encoding_header(headers: &[u8]) -> bool {
+    h1_request_framing(headers).has_transfer_encoding
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct H1RequestFraming {
+    body_len: usize,
+    has_content_length: bool,
+    has_transfer_encoding: bool,
+}
+
+#[inline(always)]
+fn h1_request_framing(headers: &[u8]) -> H1RequestFraming {
+    let mut framing = H1RequestFraming::default();
+    let mut line_start = 0usize;
+    while line_start < headers.len() {
+        let line_len = headers[line_start..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(headers.len() - line_start);
+        let line = &headers[line_start..line_start + line_len];
+        if let Some(colon) = line.iter().position(|b| *b == b':') {
+            if line[..colon].eq_ignore_ascii_case(b"transfer-encoding") {
+                framing.has_transfer_encoding = true;
+            } else if line[..colon].eq_ignore_ascii_case(b"content-length") {
+                framing.has_content_length = true;
+                // `colon + 1` can equal `line.len()` when the colon is the
+                // last byte in the line (e.g. `Content-Length:` with no
+                // value), producing an empty slice rather than an
+                // out-of-bounds index. `.get()` plus `unwrap_or(0)` handles
+                // that case and any other malformed value by treating the
+                // header as a zero-length body instead of panicking.
+                framing.body_len = line
+                    .get(colon + 1..)
+                    .and_then(parse_content_length_value)
+                    .unwrap_or(0);
+            }
+        }
+        if line_start + line_len == headers.len() {
+            break;
+        }
+        line_start += line_len + 2;
+    }
+    // Fast path for the benchmark/common case: HTTP/1.1 GET/HEAD requests
+    // without an explicit Content-Length have no framed body to drain.
+    if (headers.starts_with(b"GET ") || headers.starts_with(b"HEAD "))
+        && !framing.has_content_length
+    {
+        framing.body_len = 0;
+    }
+    framing
+}
+
+#[inline(always)]
+fn parse_content_length_value(mut value: &[u8]) -> Option<usize> {
+    while matches!(value.first(), Some(b' ' | b'\t')) {
+        value = &value[1..];
+    }
+    while matches!(value.last(), Some(b' ' | b'\t' | b'\r')) {
+        value = &value[..value.len() - 1];
+    }
+    if value.is_empty() {
+        return None;
+    }
+
+    let mut n = 0usize;
+    for b in value {
+        match *b {
+            b'0'..=b'9' => {
+                n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(n)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::h1_request_body_len;
+    use super::{h1_request_body_len, has_content_length_header, has_transfer_encoding_header};
 
     #[test]
     fn h1_get_with_explicit_content_length_has_body() {
         let headers = b"GET / HTTP/1.1\r\nhost: example\r\ncontent-length: 5";
 
         assert_eq!(h1_request_body_len(headers), 5);
+    }
+
+    #[test]
+    fn h1_post_with_explicit_content_length_has_body() {
+        let headers = b"POST / HTTP/1.1\r\nhost: example\r\ncontent-length: 5";
+
+        assert_eq!(h1_request_body_len(headers), 5);
+    }
+
+    #[test]
+    fn h1_get_without_content_length_skips_body_parse() {
+        let headers = b"GET / HTTP/1.1\r\nhost: example";
+
+        assert_eq!(h1_request_body_len(headers), 0);
+        assert!(!has_content_length_header(headers));
+    }
+
+    #[test]
+    fn h1_detects_transfer_encoding_header() {
+        let headers = b"POST / HTTP/1.1\r\nhost: example\r\nTransfer-Encoding: chunked";
+
+        assert!(has_transfer_encoding_header(headers));
+    }
+
+    #[test]
+    fn h1_header_detection_requires_field_name() {
+        let headers = b"GET / HTTP/1.1\r\nhost: example\r\nx-content-length-note: none";
+
+        assert!(!has_content_length_header(headers));
     }
 }
 
@@ -287,6 +443,13 @@ async fn handle_h1h2(
     peer: SocketAddr,
     req: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
+    if let Some(body) = inline_engine
+        .as_ref()
+        .and_then(|inline| inline.static_response_body.clone())
+    {
+        return Response::new(Full::new(body));
+    }
+
     let (parts, body) = req.into_parts();
     let size_hint = body.size_hint();
     let body_bytes = if size_hint.lower() == 0 && size_hint.upper() == Some(0) {
@@ -356,8 +519,15 @@ async fn serve_h3_optional(
     };
 
     let server_cfg = build_quinn_server_config(&tls)?;
-    let endpoint = quinn::Endpoint::server(server_cfg, addr)
-        .with_context(|| format!("bind UDP/QUIC {}", addr))?;
+    let udp = bind_udp_socket(addr).with_context(|| format!("bind UDP/QUIC {}", addr))?;
+    let runtime = quinn::default_runtime().context("no Quinn async runtime available")?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server_cfg),
+        udp,
+        runtime,
+    )
+    .with_context(|| format!("create UDP/QUIC endpoint {}", addr))?;
     tracing::info!(addr = %addr, "h3 listener up");
 
     while let Some(incoming) = endpoint.accept().await {
@@ -402,7 +572,51 @@ fn build_quinn_server_config(tls: &TlsConfig) -> Result<quinn::ServerConfig> {
 
     let qcrypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .context("wrap rustls as QuicServerConfig")?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(qcrypto)))
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(qcrypto));
+    server
+        .incoming_buffer_size(16 << 20)
+        .incoming_buffer_size_total(128 << 20);
+
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(4096))
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(4096))
+        .stream_receive_window(quinn::VarInt::from_u32(2 << 20))
+        .receive_window(quinn::VarInt::from_u32(16 << 20))
+        .send_window(16 << 20)
+        .send_fairness(false)
+        .initial_rtt(Duration::from_millis(10))
+        .keep_alive_interval(Some(Duration::from_secs(10)))
+        .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
+        .enable_segmentation_offload(true);
+    server.transport_config(Arc::new(transport));
+    Ok(server)
+}
+
+fn bind_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    let socket = Socket::new(
+        Domain::for_address(addr),
+        Type::DGRAM,
+        Some(SocketProtocol::UDP),
+    )
+    .context("create UDP socket")?;
+    socket.set_reuse_address(true).context("set SO_REUSEADDR")?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true).context("set SO_REUSEPORT")?;
+    // Buffer sizing is a best-effort tuning knob: some kernels/containers
+    // restrict SO_RCVBUF/SO_SNDBUF, and failing to widen them shouldn't
+    // prevent HTTP/3 startup.
+    if let Err(e) = socket.set_recv_buffer_size(4 << 20) {
+        tracing::warn!(error = %e, "failed to set UDP SO_RCVBUF, continuing with default");
+    }
+    if let Err(e) = socket.set_send_buffer_size(4 << 20) {
+        tracing::warn!(error = %e, "failed to set UDP SO_SNDBUF, continuing with default");
+    }
+    socket
+        .set_nonblocking(true)
+        .context("set UDP nonblocking")?;
+    socket.bind(&addr.into()).context("bind UDP socket")?;
+    Ok(socket.into())
 }
 
 fn load_certs(path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
